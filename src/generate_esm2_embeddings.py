@@ -332,6 +332,10 @@ def generate_embeddings(df: pd.DataFrame,
     
     uniprot_ids = df['uniprot_id'].tolist()
     
+    # Track cached sequence embeddings to avoid recalculation
+    cached_sequence = None
+    cached_token_representations = None
+    
     for i, (label, seq, residue_idx, residue_type, uniprot_id) in enumerate(
         zip(labels, sequences, residue_indices, residue_types, uniprot_ids)
     ):
@@ -342,11 +346,23 @@ def generate_embeddings(df: pd.DataFrame,
             skipped_count += 1
             continue
         
-        # Generate embeddings
-        print(f"[{i+1}/{len(df)}] Processing {label} (length={len(seq)})")
-        token_representations = process_batch(
-            model, (label, seq), batch_converter, repr_layer_id
-        )
+        # Only calculate token representations if this is a new sequence
+        if seq != cached_sequence:
+            # Clear previous cache to free memory
+            cached_token_representations = None
+            cached_sequence = seq
+            
+            # Generate embeddings for the new sequence
+            print(f"[{i+1}/{len(df)}] Processing {label} (length={len(seq)})")
+            token_representations = process_batch(
+                model, (label, seq), batch_converter, repr_layer_id
+            )
+            # Cache for reuse with other residues from same sequence
+            cached_token_representations = token_representations
+        else:
+            # Reuse cached token representations for this sequence
+            token_representations = cached_token_representations
+            print(f"[{i+1}/{len(df)}] Processing {label} (cached - length={len(seq)})")
         
         # Generate embedding based on target
         try:
@@ -383,6 +399,10 @@ def generate_embeddings(df: pd.DataFrame,
         output_df.to_csv(output_file, mode=mode, header=header, index=False)
         write_header = False
         processed_count += 1
+    
+    # Clean up cached embeddings
+    cached_token_representations = None
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     print(f"\nCompleted: {processed_count} sequences processed, {skipped_count} skipped")
 
