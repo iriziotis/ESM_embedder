@@ -1,0 +1,9 @@
+# Ignore all files and directories in data/ and results/
+# but exclude files starting with "test"
+
+**/data/*
+**/results/*
+
+# Allow test files to be tracked
+!**/data/test*
+!**/results/test*
