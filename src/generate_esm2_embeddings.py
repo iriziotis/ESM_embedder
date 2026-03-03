@@ -317,12 +317,19 @@ def generate_embeddings(df: pd.DataFrame,
     
     labels = df['label'].tolist()
     sequences = df['sequence'].tolist()
-    residue_indices = df['residue_of_interest_idx'].tolist()
+    
+    # Handle residue information (may not exist for sequence-only mode)
+    if 'residue_of_interest_idx' in df.columns:
+        residue_indices = df['residue_of_interest_idx'].tolist()
+    else:
+        residue_indices = [None] * len(df)
+    
     # Get residue types, defaulting to 'C' if column doesn't exist
     if 'residue_type' in df.columns:
         residue_types = df['residue_type'].tolist()
     else:
         residue_types = ['C'] * len(df)
+    
     uniprot_ids = df['uniprot_id'].tolist()
     
     for i, (label, seq, residue_idx, residue_type, uniprot_id) in enumerate(
@@ -465,27 +472,69 @@ def main(args):
     print("ESM-2 Protein Sequence Embeddings Generator")
     print("=" * 80)
     
+    # Check target mode and warn if residue_type is provided but not needed
+    if args.target == 'sequence' and args.residue_type != 'C':
+        print(f"\nWARNING: --residue_type '{args.residue_type}' is ignored when --target is 'sequence'")
+        print("Residue-level embeddings will not be calculated.")
+    
     # Load and validate input data
     print(f"\nLoading sequences from {args.seq_file}...")
-    if args.seq_file.endswith('.csv'):
-        df = load_sequence_csv(args.seq_file, residue_type=args.residue_type, all_residues=args.all_residues)
-    elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
-        df = load_sequence_fasta(args.seq_file, residue_type=args.residue_type)
-    else:
-        raise ValueError("Input file must be .csv or .fasta")
     
-    if args.all_residues:
-        print(f"Loaded {len(df)} residue instances from sequences")
+    if args.target == 'sequence':
+        # For sequence-only target, load without residue processing
+        if args.seq_file.endswith('.csv'):
+            df = pd.read_csv(args.seq_file)
+            # Validate required columns
+            required_cols = {'uniprot_id', 'pep_seq'}
+            if not required_cols.issubset(df.columns):
+                raise ValueError(
+                    f"CSV must contain columns: {required_cols}. "
+                    f"Found: {set(df.columns)}"
+                )
+            # Filter out rows with missing sequences
+            df = df.dropna(subset=['pep_seq'])
+            # Create label from uniprot_id only
+            df['label'] = df['uniprot_id'].astype(str)
+            # Rename pep_seq to sequence
+            df_formatted = df[['label', 'pep_seq', 'uniprot_id']].copy()
+            df_formatted.columns = ['label', 'sequence', 'uniprot_id']
+        elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
+            records = list(SeqIO.parse(args.seq_file, 'fasta'))
+            data = []
+            for record in records:
+                header_parts = record.id.split('|')
+                uniprot_id = header_parts[1] if len(header_parts) >= 2 else record.id
+                data.append({
+                    'label': uniprot_id,
+                    'sequence': str(record.seq),
+                    'uniprot_id': uniprot_id
+                })
+            df_formatted = pd.DataFrame(data)
+        else:
+            raise ValueError("Input file must be .csv or .fasta")
+        
+        print(f"Loaded {len(df_formatted)} sequences (sequence-only mode)")
     else:
-        print(f"Loaded {len(df)} sequences")
-    
-    # Format data (only needed when not using all_residues from CSV)
-    if args.seq_file.endswith('.csv') and not args.all_residues:
-        print(f"\nFormatting sequences for target: {args.target}...")
-        df_formatted = format_sequence_dataframe(df, residue_type=args.residue_type)
-    else:
-        # Already formatted for FASTA or all_residues mode
-        df_formatted = df
+        # For residue or both targets, use residue processing
+        if args.seq_file.endswith('.csv'):
+            df = load_sequence_csv(args.seq_file, residue_type=args.residue_type, all_residues=args.all_residues)
+        elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
+            df = load_sequence_fasta(args.seq_file, residue_type=args.residue_type)
+        else:
+            raise ValueError("Input file must be .csv or .fasta")
+        
+        if args.all_residues:
+            print(f"Loaded {len(df)} residue instances from sequences")
+        else:
+            print(f"Loaded {len(df)} sequences")
+        
+        # Format data (only needed when not using all_residues from CSV)
+        if args.seq_file.endswith('.csv') and not args.all_residues:
+            print(f"\nFormatting sequences for target: {args.target}...")
+            df_formatted = format_sequence_dataframe(df, residue_type=args.residue_type)
+        else:
+            # Already formatted for FASTA or all_residues mode
+            df_formatted = df
     
     # Load model
     print(f"\nLoading ESM-2 model: {args.model_name}...")
