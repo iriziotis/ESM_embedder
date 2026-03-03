@@ -21,6 +21,7 @@ This package provides a unified, well-documented implementation for:
 - `sequence`: Whole-sequence mean embedding
 - `residue`: Specific residue position embedding
 - `both`: Concatenated sequence + residue embeddings
+- `peptide`: Whole-sequence embedding with peptide-specific label (uniprot_id_sequence)
 - **Default behavior**: Processes all residue instances automatically (ideal for peptides and FASTA files)
 
 ✅ **Scalability**
@@ -194,6 +195,18 @@ python src/generate_esm2_embeddings.py \
     --output_file combined_embeddings.csv
 ```
 
+### Generate Whole-Sequence Embeddings for Peptide Library (with Peptide Tracking)
+
+```bash
+# Peptide target generates one embedding per peptide with label format: uniprot_id_sequence
+python src/generate_esm2_embeddings.py \
+    --seq_file peptides.csv \
+    --model_name esm2_t12_35M_UR50D \
+    --target peptide \
+    --max_seq_length 100 \
+    --output_file peptide_embeddings.csv
+```
+
 ### Generate Embeddings for All Residue Instances (Default Behavior)
 
 ```bash
@@ -304,15 +317,40 @@ P12345_C46,P12345,"[-0.234, 0.567, -0.890, ...]"
 P67890_C78,P67890,"[-0.345, 0.678, -0.901, ...]"
 ```
 
+### Output Format by Target
+
+**For `sequence` target** (labeled by uniprot_id):
+```csv
+label,uniprot_id,embedding
+P12345,P12345,"[-0.123, 0.456, ...]"
+P67890,P67890,"[-0.234, 0.567, ...]"
+```
+
+**For `peptide` target** (labeled by uniprot_id_sequence):
+```csv
+label,uniprot_id,embedding
+P12345_MVLSGDAKSCPEP,P12345,"[-0.123, 0.456, ...]"
+P67890_MCTAYIAKQRQIS,P67890,"[-0.234, 0.567, ...]"
+```
+
+**For `residue` target** (labeled by uniprot_id_residue_position):
+```csv
+label,uniprot_id,embedding
+P12345_C7,P12345,"[-0.123, 0.456, ...]"
+P12345_C12,P12345,"[-0.234, 0.567, ...]"
+P67890_C3,P67890,"[-0.345, 0.678, ...]"
+```
+
 ## When to Use Each Mode
 
 ### Target Options
 
 | Target | Use Case | Output |
 |--------|----------|--------|
-| `sequence` | Whole protein/peptide representation | Single averaged embedding per input sequence |
+| `sequence` | Whole protein/peptide representation | Single averaged embedding per input sequence, labeled by uniprot_id |
 | `residue` | Site-specific analysis | Embedding for each residue instance (default) or specific position |
 | `both` | Combined context + site info | Concatenated [sequence + residue] embedding |
+| `peptide` | Peptide-specific embeddings with sequence tracking | Single averaged embedding per peptide, labeled by uniprot_id_sequence |
 
 ### All Residues Mode (Default)
 
@@ -341,7 +379,7 @@ P67890_C78,P67890,"[-0.345, 0.678, -0.901, ...]"
 |----------|------|-------------|
 | `--seq_file` | path | Input FASTA or CSV file |
 | `--model_name` | str | ESM-2 model ID |
-| `--target` | str | 'sequence' (whole-seq mean), 'residue' (specific residue), or 'both' (concatenated) |
+| `--target` | str | 'sequence', 'residue', 'both', or 'peptide' |
 | `--max_seq_length` | int | Maximum sequence length to process |
 | `--output_file` | path | Output CSV file path |
 

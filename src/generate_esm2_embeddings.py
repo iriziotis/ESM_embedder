@@ -354,6 +354,8 @@ def generate_embeddings(df: pd.DataFrame,
                 embedding = get_residue_embedding(residue_idx, token_representations, sequence=seq, residue_type=residue_type)
             elif target == 'sequence':
                 embedding = get_whole_sequence_embedding(token_representations, method='mean')
+            elif target == 'peptide':
+                embedding = get_whole_sequence_embedding(token_representations, method='mean')
             elif target == 'both':
                 # Concatenate sequence and residue embeddings
                 seq_embedding = get_whole_sequence_embedding(token_representations, method='mean')
@@ -473,15 +475,15 @@ def main(args):
     print("=" * 80)
     
     # Check target mode and warn if residue_type is provided but not needed
-    if args.target == 'sequence' and args.residue_type != 'C':
-        print(f"\nWARNING: --residue_type '{args.residue_type}' is ignored when --target is 'sequence'")
+    if args.target in ['sequence', 'peptide'] and args.residue_type != 'C':
+        print(f"\nWARNING: --residue_type '{args.residue_type}' is ignored when --target is '{args.target}'")
         print("Residue-level embeddings will not be calculated.")
     
     # Load and validate input data
     print(f"\nLoading sequences from {args.seq_file}...")
     
-    if args.target == 'sequence':
-        # For sequence-only target, load without residue processing
+    if args.target in ['sequence', 'peptide']:
+        # For sequence and peptide targets, load without residue processing
         if args.seq_file.endswith('.csv'):
             df = pd.read_csv(args.seq_file)
             # Validate required columns
@@ -493,8 +495,13 @@ def main(args):
                 )
             # Filter out rows with missing sequences
             df = df.dropna(subset=['pep_seq'])
-            # Create label from uniprot_id only
-            df['label'] = df['uniprot_id'].astype(str)
+            # Create label based on target
+            if args.target == 'peptide':
+                # For peptide target, label is uniprot_id_sequence
+                df['label'] = df['uniprot_id'].astype(str) + '_' + df['pep_seq'].astype(str)
+            else:
+                # For sequence target, label is just uniprot_id
+                df['label'] = df['uniprot_id'].astype(str)
             # Rename pep_seq to sequence
             df_formatted = df[['label', 'pep_seq', 'uniprot_id']].copy()
             df_formatted.columns = ['label', 'sequence', 'uniprot_id']
@@ -504,16 +511,21 @@ def main(args):
             for record in records:
                 header_parts = record.id.split('|')
                 uniprot_id = header_parts[1] if len(header_parts) >= 2 else record.id
+                seq = str(record.seq)
+                if args.target == 'peptide':
+                    label = f"{uniprot_id}_{seq}"
+                else:
+                    label = uniprot_id
                 data.append({
-                    'label': uniprot_id,
-                    'sequence': str(record.seq),
+                    'label': label,
+                    'sequence': seq,
                     'uniprot_id': uniprot_id
                 })
             df_formatted = pd.DataFrame(data)
         else:
             raise ValueError("Input file must be .csv or .fasta")
         
-        print(f"Loaded {len(df_formatted)} sequences (sequence-only mode)")
+        print(f"Loaded {len(df_formatted)} sequences ({args.target} mode)")
     else:
         # For residue or both targets, use residue processing
         if args.seq_file.endswith('.csv'):
@@ -590,7 +602,14 @@ Examples:
       --target both \\
       --max_seq_length 1024
 
-  # Generate embeddings for all cysteines in peptide sequences (default behavior)
+  # Generate embeddings for peptide sequences with peptide-specific labels
+  python generate_esm2_embeddings.py \\
+      --seq_file peptides.csv \\
+      --model_name esm2_t12_35M_UR50D \\
+      --target peptide \\
+      --max_seq_length 100
+
+  # Generate embeddings for all cysteines in peptide sequences
   python generate_esm2_embeddings.py \\
       --seq_file peptides.csv \\
       --model_name esm2_t12_35M_UR50D \\
@@ -637,8 +656,8 @@ Examples:
         '--target', 
         type=str, 
         required=True,
-        choices=['sequence', 'residue', 'both'],
-        help='Embedding target: sequence (whole sequence mean), residue (specific residue), or both (concatenated)'
+        choices=['sequence', 'residue', 'both', 'peptide'],
+        help='Embedding target: sequence (whole sequence mean), residue (specific residue), both (concatenated), or peptide (sequence with label as uniprot_id_sequence)'
     )
     parser.add_argument(
         '--residue_type', 
