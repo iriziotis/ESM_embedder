@@ -386,10 +386,12 @@ def generate_embeddings(df: pd.DataFrame,
         
         # Prepare output with rounded embeddings (3 decimals)
         rounded_embedding = np.round(embedding, 3)
+        # Format embedding as string with exactly 3 decimal places
+        embedding_str = '[' + ', '.join(f'{x:.3f}' for x in rounded_embedding) + ']'
         output_data = {
             'label': label,
             'uniprot_id': uniprot_id if pd.notna(uniprot_id) else '',
-            'embedding': rounded_embedding.tolist()
+            'embedding': embedding_str
         }
         
         if output_format == 'parquet':
