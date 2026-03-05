@@ -292,19 +292,21 @@ def generate_embeddings(df: pd.DataFrame,
                        repr_layer_id: int,
                        max_seq_length: int = 1024,
                        min_seq_length: int = 0,
-                       target: str = 'sequence') -> None:
+                       target: str = 'sequence',
+                       output_format: str = 'csv') -> None:
     """
-    Generate embeddings for all sequences in a dataframe and write to CSV.
+    Generate embeddings for all sequences in a dataframe and write to file.
     
     Args:
         df: DataFrame with columns: label, sequence, residue_of_interest_idx, residue_type, uniprot_id
-        output_file: Path to output CSV file
+        output_file: Path to output file (CSV or Parquet)
         model: ESM-2 model
         batch_converter: Batch converter
         repr_layer_id: Layer ID for representations
         max_seq_length: Maximum sequence length to process
         min_seq_length: Minimum sequence length to process
         target: Embedding target ('sequence', 'residue', or 'peptide')
+        output_format: Output format ('csv' or 'parquet')
     """
     # Clean up old output file to ensure fresh start (no appending to previous runs)
     output_path = Path(output_file)
@@ -314,6 +316,9 @@ def generate_embeddings(df: pd.DataFrame,
     skipped_count = 0
     processed_count = 0
     write_header = True  # Always write header since we're starting fresh
+    
+    # For parquet, collect all records in memory
+    all_records = [] if output_format == 'parquet' else None
     
     labels = df['label'].tolist()
     sequences = df['sequence'].tolist()
@@ -379,21 +384,31 @@ def generate_embeddings(df: pd.DataFrame,
             skipped_count += 1
             continue
         
-        # Prepare output
+        # Prepare output with rounded embeddings (3 decimals)
+        rounded_embedding = np.round(embedding, 3)
         output_data = {
             'label': label,
             'uniprot_id': uniprot_id if pd.notna(uniprot_id) else '',
-            'embedding': embedding.tolist()
+            'embedding': rounded_embedding.tolist()
         }
         
-        output_df = pd.DataFrame([output_data])
+        if output_format == 'parquet':
+            # Collect records for batch writing
+            all_records.append(output_data)
+        else:
+            # Write to CSV incrementally
+            output_df = pd.DataFrame([output_data])
+            mode = 'w' if write_header else 'a'
+            header = write_header
+            output_df.to_csv(output_file, mode=mode, header=header, index=False)
+            write_header = False
         
-        # Write to CSV
-        mode = 'w' if write_header else 'a'
-        header = write_header
-        output_df.to_csv(output_file, mode=mode, header=header, index=False)
-        write_header = False
         processed_count += 1
+    
+    # Write parquet file if that format was selected
+    if output_format == 'parquet' and all_records:
+        output_df = pd.DataFrame(all_records)
+        output_df.to_parquet(output_file, index=False, engine='pyarrow')
     
     # Clean up cached embeddings
     cached_token_representations = None
@@ -574,6 +589,7 @@ def main(args):
     
     # Generate embeddings
     print(f"\nGenerating embeddings with target: {args.target}...")
+    print(f"Output format: {args.output_format}")
     generate_embeddings(
         df_formatted,
         output_file=args.output_file,
@@ -582,7 +598,8 @@ def main(args):
         repr_layer_id=repr_layer_id,
         max_seq_length=args.max_seq_length,
         min_seq_length=args.min_seq_length,
-        target=args.target
+        target=args.target,
+        output_format=args.output_format
     )
     
     print(f"\nEmbeddings written to: {args.output_file}")
@@ -610,7 +627,13 @@ Examples:
       --residue_type C \\
       --max_seq_length 1024
 
-
+  # Generate embeddings and save to Parquet format
+  python generate_esm2_embeddings.py \\
+      --seq_file sequences.csv \\
+      --model_name esm2_t6_8M_UR50D \\
+      --target sequence \\
+      --output_format parquet \\
+      --max_seq_length 1024
 
   # Generate embeddings for peptide sequences with peptide-specific labels
   python generate_esm2_embeddings.py \\
@@ -703,7 +726,14 @@ Examples:
         '--output_file', 
         type=str, 
         required=True,
-        help='Path to output CSV file with embeddings'
+        help='Path to output file with embeddings (CSV or Parquet)'
+    )
+    parser.add_argument(
+        '--output_format',
+        type=str,
+        choices=['csv', 'parquet'],
+        default='csv',
+        help='Output file format (default: csv)'
     )
     
     # Optional arguments
