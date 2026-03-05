@@ -304,7 +304,7 @@ def generate_embeddings(df: pd.DataFrame,
         repr_layer_id: Layer ID for representations
         max_seq_length: Maximum sequence length to process
         min_seq_length: Minimum sequence length to process
-        target: Embedding target ('sequence', 'residue', or 'both')
+        target: Embedding target ('sequence', 'residue', or 'peptide')
     """
     # Clean up old output file to ensure fresh start (no appending to previous runs)
     output_path = Path(output_file)
@@ -372,11 +372,6 @@ def generate_embeddings(df: pd.DataFrame,
                 embedding = get_whole_sequence_embedding(token_representations, method='mean')
             elif target == 'peptide':
                 embedding = get_whole_sequence_embedding(token_representations, method='mean')
-            elif target == 'both':
-                # Concatenate sequence and residue embeddings
-                seq_embedding = get_whole_sequence_embedding(token_representations, method='mean')
-                res_embedding = get_residue_embedding(residue_idx, token_representations, sequence=seq, residue_type=residue_type)
-                embedding = np.concatenate([seq_embedding, res_embedding])
             else:
                 raise ValueError(f"Unknown target: {target}")
         except ValueError as e:
@@ -547,7 +542,7 @@ def main(args):
         
         print(f"Loaded {len(df_formatted)} sequences ({args.target} mode)")
     else:
-        # For residue or both targets, use residue processing
+        # For residue target, use residue processing
         if args.seq_file.endswith('.csv'):
             df = load_sequence_csv(args.seq_file, residue_type=args.residue_type, all_residues=args.all_residues)
         elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
@@ -615,12 +610,7 @@ Examples:
       --residue_type C \\
       --max_seq_length 1024
 
-  # Generate concatenated sequence + residue embeddings
-  python generate_esm2_embeddings.py \\
-      --seq_file sequences.csv \\
-      --model_name esm2_t30_150M_UR50D \\
-      --target both \\
-      --max_seq_length 1024
+
 
   # Generate embeddings for peptide sequences with peptide-specific labels
   python generate_esm2_embeddings.py \\
@@ -676,8 +666,8 @@ Examples:
         '--target', 
         type=str, 
         required=True,
-        choices=['sequence', 'residue', 'both', 'peptide'],
-        help='Embedding target: sequence (whole sequence mean), residue (specific residue), both (concatenated), or peptide (sequence with label as uniprot_id_sequence)'
+        choices=['sequence', 'residue', 'peptide'],
+        help='Embedding target: sequence (whole sequence mean), residue (specific residue), or peptide (sequence with label as uniprot_id_sequence)'
     )
     parser.add_argument(
         '--residue_type', 

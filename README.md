@@ -1,6 +1,6 @@
-# ESM-2 Protein Sequence Embeddings Generator
+# ESM-2 Embeddings & Merge Toolkit
 
-A comprehensive tool for generating protein sequence embeddings using Meta's ESM-2 (Evolutionary Scale Modeling) language model. This tool converts protein sequences into numerical representations (embeddings) that capture biological meaning, with support for aggregating at specific residue positions.
+A comprehensive solution for generating protein sequence embeddings using Meta's ESM-2 (Evolutionary Scale Modeling) language model and efficiently merging embeddings from cysteines, peptides, and proteins into consolidated feature tables for machine learning analysis.
 
 ## Overview
 
@@ -634,6 +634,368 @@ for uniprot_id in df['uniprot_id'].unique():
     protein_embs = embeddings[df['uniprot_id'] == uniprot_id]
     print(f"{uniprot_id}: {protein_embs.shape}")
 ```
+
+## References
+
+- [ESM-2 Paper](https://www.biorxiv.org/content/10.1101/2022.07.20.500902v1)
+- [Fair-ESM GitHub](https://github.com/facebookresearch/fair-esm)
+- [UniProt Format Guide](https://www.uniprot.org/help/fasta-headers)
+
+---
+
+# Embedding Merge Tool
+
+A Python script for efficiently merging ESM-2 embeddings from cysteines, peptides, and proteins into concatenated feature tables for downstream machine learning analysis.
+
+## Merge Tool Features
+
+- **Multiple file format support**: Load embeddings from `.npy`, `.npz`, `.parquet`, or `.csv` files
+- **Flexible aggregation strategies**: 
+  - `shortest`: Use the shortest peptide containing each cysteine
+  - `average`: Average embeddings across all peptides containing each cysteine
+- **Four merge types**:
+  1. Cysteine + Peptide embeddings
+  2. Cysteine + Protein embeddings
+  3. Cysteine + Peptide + Protein embeddings  
+  4. Peptide + Protein embeddings
+- **Memory-efficient processing**: Handles large datasets without loading entire matrices into memory
+- **Parallel processing ready**: Architected for scalable processing
+- **Comprehensive logging**: Detailed progress tracking and error reporting
+
+## Merge Tool Installation
+
+Ensure you have the required dependencies:
+
+```bash
+pip install numpy pandas scipy tqdm
+```
+
+For parquet support:
+
+```bash
+pip install pyarrow
+```
+
+## Merge Tool Input Data Format
+
+### Embeddings
+Embeddings should be numpy arrays with shape `(n_samples, embedding_dim)`. Supported formats:
+- `.npy`: numpy binary format
+- `.npz`: numpy compressed format (looks for 'embeddings' key or first array)
+- `.parquet`: parquet with numeric columns as embeddings
+- `.csv`: CSV with numeric columns as embeddings
+
+### Mapping File
+A CSV or Parquet file with the following columns:
+- `uniprot_id`: Protein identifier
+- `pep_seq`: Peptide sequence
+- `residue`: Cysteine identifier (e.g., "C45", "C127")
+
+Example mapping file:
+```csv
+uniprot_id,pep_seq,residue
+P12345,ACDEFTGK,C45
+P12345,ACDEFGHK,C45
+P67890,ACDLMN,C127
+```
+
+## Merge Tool Usage
+
+### Basic Usage
+
+```bash
+python src/merge_embeddings.py \
+    --cysteine-embeddings path/to/cys_embeddings.npy \
+    --peptide-embeddings path/to/pep_embeddings.npy \
+    --protein-embeddings path/to/protein_embeddings.npy \
+    --mapping path/to/mapping.csv \
+    --output-dir path/to/output
+```
+
+### With Options
+
+```bash
+python src/merge_embeddings.py \
+    --cysteine-embeddings data/cys_embeddings.npy \
+    --peptide-embeddings data/pep_embeddings.npy \
+    --protein-embeddings data/protein_embeddings.npy \
+    --mapping data/mapping.csv \
+    --output-dir results/merged \
+    --aggregation-method average \
+    --output-format both \
+    --tables cys_pep cys_pep_prot \
+    --log-level DEBUG
+```
+
+### Test Merge Tool
+
+Verify the merge tool works on your system with synthetic data:
+
+```bash
+cd src
+
+# Run test with synthetic data
+python test_merge_embeddings.py --output-dir ./test_embeddings
+
+# Expected output:
+# ✓ Cysteine embeddings: (50, 1280)
+# ✓ Peptide embeddings: (100, 1280)
+# ✓ Protein embeddings: (20, 1280)
+# ✓ Mapping file: 150 rows
+# ✓ All tests passed!
+```
+
+## Merge Tool Arguments
+
+- `--cysteine-embeddings` (required): Path to cysteine embeddings file
+- `--peptide-embeddings` (required): Path to peptide embeddings file
+- `--protein-embeddings` (required): Path to protein embeddings file
+- `--mapping` (required): Path to mapping CSV/parquet file
+- `--output-dir` (required): Output directory for merged tables
+
+### Merge Tool Options
+
+- `--aggregation-method` (default: `shortest`): 
+  - `shortest`: Use shortest peptide for each cysteine
+  - `average`: Average embeddings across all peptides for each cysteine
+
+- `--output-format` (default: `parquet`):
+  - `parquet`: Save as compressed parquet files (recommended)
+  - `csv`: Save as CSV files (larger file sizes)
+  - `both`: Save in both formats
+
+- `--tables` (default: `all`):
+  - `cys_pep`: Cysteine + peptide merged table
+  - `cys_prot`: Cysteine + protein merged table
+  - `cys_pep_prot`: Cysteine + peptide + protein merged table
+  - `pep_prot`: Peptide + protein merged table
+  - `all`: Create all four tables
+
+- `--log-level` (default: `INFO`):
+  - `DEBUG`: Verbose debug output
+  - `INFO`: Standard informational output
+  - `WARNING`: Only show warnings and errors
+  - `ERROR`: Only show errors
+
+## Merge Tool Output
+
+The script generates parquet/CSV files with concatenated embeddings:
+
+### cys_pep_merged
+Columns:
+- `uniprot_id`: Protein identifier
+- `residue`: Cysteine residue identifier
+- `pep_seq`: Peptide sequence (shortest for aggregation_method=shortest)
+- `aggregation_method`: Method used for peptide aggregation
+- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+
+### cys_prot_merged
+Columns:
+- `uniprot_id`: Protein identifier
+- `residue`: Cysteine residue identifier
+- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+
+### cys_pep_prot_merged
+Columns:
+- `uniprot_id`: Protein identifier
+- `residue`: Cysteine residue identifier
+- `pep_seq`: Peptide sequence
+- `protein_id`: Protein identifier (from mapping)
+- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+
+### pep_prot_merged
+Columns:
+- `pep_seq`: Peptide sequence
+- `protein_id`: Protein identifier
+- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+
+## SLURM Job Submission for Merge
+
+For cluster execution, use the provided SLURM script:
+
+### Basic Submission
+
+```bash
+sbatch src/submit_merge_embeddings.slurm
+```
+
+### Custom Resource Allocation
+
+```bash
+sbatch --time=02:00:00 --mem=32G --cpus-per-task=4 src/submit_merge_embeddings.slurm
+```
+
+### Monitor Job
+
+```bash
+# Check job status
+squeue -j <job_id>
+
+# View logs
+tail -f logs/merge_embeddings_<job_id>.log
+```
+
+### Configuration
+
+Edit these variables in `src/submit_merge_embeddings.slurm`:
+
+```bash
+# Base directories
+WORK_DIR="/path/to/work"
+DATA_DIR="${WORK_DIR}/data"
+OUTPUT_DIR="${WORK_DIR}/results"
+
+# Input files
+CYSTEINE_EMBEDDINGS="${DATA_DIR}/cysteine_embeddings.npy"
+PEPTIDE_EMBEDDINGS="${DATA_DIR}/peptide_embeddings.npy"
+PROTEIN_EMBEDDINGS="${DATA_DIR}/protein_embeddings.npy"
+MAPPING_FILE="${DATA_DIR}/mapping.csv"
+
+# Script parameters
+AGGREGATION_METHOD="shortest"
+OUTPUT_FORMAT="parquet"
+TABLES="all"
+```
+
+## Merge Tool Examples
+
+### Example 1: Basic Workflow
+
+```bash
+# Create output directory
+mkdir -p results/merged_embeddings
+
+# Run merge with shortest peptide aggregation
+python src/merge_embeddings.py \
+    --cysteine-embeddings data/embeddings/cysteines.npy \
+    --peptide-embeddings data/embeddings/peptides.npy \
+    --protein-embeddings data/embeddings/proteins.npy \
+    --mapping data/metadata/mapping.csv \
+    --output-dir results/merged_embeddings \
+    --aggregation-method shortest
+
+# Output files:
+# - results/merged_embeddings/cys_pep_merged.parquet
+# - results/merged_embeddings/cys_prot_merged.parquet
+# - results/merged_embeddings/cys_pep_prot_merged.parquet
+# - results/merged_embeddings/pep_prot_merged.parquet
+```
+
+### Example 2: Using Parquet Files
+
+```bash
+python src/merge_embeddings.py \
+    --cysteine-embeddings data/embeddings/cysteines.parquet \
+    --peptide-embeddings data/embeddings/peptides.parquet \
+    --protein-embeddings data/embeddings/proteins.parquet \
+    --mapping data/metadata/mapping.parquet \
+    --output-dir results/merged_embeddings \
+    --output-format both
+```
+
+### Example 3: Create Only Specific Tables
+
+```bash
+# Create only cysteine-based merged tables (useful for focused analysis)
+python src/merge_embeddings.py \
+    --cysteine-embeddings data/embeddings/cysteines.npy \
+    --peptide-embeddings data/embeddings/peptides.npy \
+    --protein-embeddings data/embeddings/proteins.npy \
+    --mapping data/metadata/mapping.csv \
+    --output-dir results/merged \
+    --tables cys_pep cys_prot cys_pep_prot
+```
+
+### Example 4: Use Results in ML Pipeline
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+
+# Load merged embeddings
+df = pd.read_parquet('results/merged_embeddings/cys_pep_merged.parquet')
+
+# Parse embedding strings to arrays
+import ast
+X = np.array([ast.literal_eval(emb) for emb in df['embedding']])
+
+# Standardize if needed
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# Load your labels (indexed by uniprot_id and residue)
+y = pd.read_csv('path/to/labels.csv', index_col=['uniprot_id', 'residue'])
+y = y.loc[list(zip(df['uniprot_id'], df['residue']))].values.ravel()
+
+# Train model
+clf = RandomForestClassifier(n_estimators=100, n_jobs=-1)
+clf.fit(X, y)
+
+# Make predictions
+predictions = clf.predict(X)
+
+print(f"Accuracy: {clf.score(X, y):.4f}")
+```
+
+## Merge Tool Performance Guidelines
+
+### Memory Usage
+
+The script loads embeddings sequentially:
+- **Cysteine embeddings**: (n_cys, 1280) ≈ n_cys * 10 KB
+- **Peptide embeddings**: (n_pep, 1280) ≈ n_pep * 10 KB
+- **Protein embeddings**: (n_prot, 1280) ≈ n_prot * 10 KB
+- **Mapping DataFrame**: (n_mappings, 3) ≈ n_mappings * 100 bytes
+
+Example for 100K cysteines, 1M peptides, 20K proteins:
+- Total ≈ 12 GB
+
+### Optimization Tips
+
+1. **Use parquet format**: 40-50% smaller than CSV, faster to read
+2. **Aggregate method**: `shortest` is faster than `average`
+3. **Selective table creation**: Only create tables you need
+4. **SLURM allocation**: 
+   - For < 1M samples: 32GB memory, 4 CPUs
+   - For 1M-100M samples: 64GB memory, 8 CPUs
+   - For > 100M samples: 128GB+ memory, 16 CPUs
+
+## Merge Tool Troubleshooting
+
+### Issue: "File not found" Error
+
+**Solution**: Verify all input paths are correct and files exist:
+```bash
+ls -lh /path/to/embeddings.npy
+ls -lh /path/to/mapping.csv
+```
+
+### Issue: "Missing columns" Error
+
+**Solution**: Ensure mapping file has required columns: `uniprot_id`, `pep_seq`, `residue`
+```bash
+# Check columns
+head -3 mapping.csv
+# Or for parquet:
+python -c "import pandas as pd; print(pd.read_parquet('mapping.parquet').columns)"
+```
+
+### Issue: Out of Memory
+
+**Solution**: 
+- Use parquet format for faster loading and less memory overhead
+- Consider processing in chunks or splitting mapping file
+- Increase SLURM memory allocation: `--mem=128G`
+
+### Issue: Slow Processing
+
+**Solution**:
+- Use SSD storage for data files
+- Consider using parquet format
+- Use `shortest` aggregation method
+- Increase CPU cores in SLURM: `--cpus-per-task=16`
 
 ## References
 
