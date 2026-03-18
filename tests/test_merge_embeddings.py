@@ -61,24 +61,19 @@ def create_test_embeddings(
     pep_labels = [f"{prot_ids[i % len(prot_ids)]}_{seq}" 
                   for i, seq in enumerate(pep_seq_only)]
     
-    # Save embeddings as CSV with "label" and "embedding" columns
-    # Embedding is stored as string representation of array
-    cys_df = pd.DataFrame({
-        'label': cys_ids_temp,
-        'embedding': [str(emb.tolist()) for emb in cys_emb]
-    })
+    def embeddings_to_feature_df(labels: List[str], embeddings: np.ndarray) -> pd.DataFrame:
+        """Convert embedding matrix to label + feat_1..feat_N columns."""
+        feat_data = {f'feat_{i + 1}': embeddings[:, i] for i in range(embeddings.shape[1])}
+        return pd.DataFrame({'label': labels, **feat_data})
+
+    # Save embeddings as CSV with expanded feature columns.
+    cys_df = embeddings_to_feature_df(cys_ids_temp, cys_emb)
     cys_df.to_csv(output_dir / 'cysteine_embeddings.csv', index=False)
     
-    pep_df = pd.DataFrame({
-        'label': pep_labels,
-        'embedding': [str(emb.tolist()) for emb in pep_emb]
-    })
+    pep_df = embeddings_to_feature_df(pep_labels, pep_emb)
     pep_df.to_csv(output_dir / 'peptide_embeddings.csv', index=False)
     
-    prot_df = pd.DataFrame({
-        'label': prot_ids,
-        'embedding': [str(emb.tolist()) for emb in prot_emb]
-    })
+    prot_df = embeddings_to_feature_df(prot_ids, prot_emb)
     prot_df.to_csv(output_dir / 'protein_embeddings.csv', index=False)
     
     logger.info(f"  ✓ Cysteine embeddings: {cys_emb.shape}")
@@ -100,9 +95,10 @@ def create_test_mapping(
     rows = []
     cys_label_map = {}  # Maps residue -> uniprot_id_residue
     
-    # Use provided IDs (pep_ids are full labels with protein prefix)
+    # Use provided IDs; pep_ids are labels like P00001_ACDEFTGK0.
+    # Mapping pep_seq must contain the raw sequence only (ACDEFTGK0).
     cysteines = cys_residues
-    peptides = pep_ids  # Now these are full labels like P00001_ACDEFTGK0
+    peptides = pep_ids
     proteins = prot_ids
     
     n_pep = len(peptides)
@@ -114,6 +110,8 @@ def create_test_mapping(
         selected_peptides = np.random.choice(peptides, size=n_peps_for_cys, replace=False)
         
         for pep in selected_peptides:
+            pep_seq = pep.split('_', 1)[1] if '_' in pep else pep
+
             # Randomly select 1-2 proteins for this peptide
             n_prots_for_pep = np.random.randint(1, 3)
             selected_proteins = np.random.choice(proteins, size=n_prots_for_pep, replace=False)
@@ -121,7 +119,7 @@ def create_test_mapping(
             for prot in selected_proteins:
                 rows.append({
                     'uniprot_id': prot,
-                    'pep_seq': pep,
+                    'pep_seq': pep_seq,
                     'residue': cys
                 })
                 # Track cysteine label format for first occurrence
