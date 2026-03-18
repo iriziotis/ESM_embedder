@@ -75,6 +75,62 @@ logger = setup_logging()
 
 class EmbeddingLoader:
     """Load embeddings from various file formats."""
+
+    @staticmethod
+    def _sorted_feature_columns(columns: List[str]) -> List[str]:
+        """Return feature columns sorted by numeric suffix (feat_1, feat_2, ...)."""
+        feat_cols = [col for col in columns if str(col).startswith('feat_')]
+        if not feat_cols:
+            return []
+
+        def feat_key(col: str) -> Tuple[int, str]:
+            suffix = str(col).split('_', 1)[1] if '_' in str(col) else ''
+            return (int(suffix), str(col)) if suffix.isdigit() else (10**9, str(col))
+
+        return sorted(feat_cols, key=feat_key)
+
+    @staticmethod
+    def _parse_embedding_series(series: pd.Series) -> np.ndarray:
+        """Parse a Series of embeddings that may be strings or iterables."""
+        import ast
+        import json
+
+        n = len(series)
+        if n == 0:
+            return np.empty((0, 0), dtype=np.float32)
+
+        parsed_embeddings: List[np.ndarray] = []
+        for emb in series:
+            if isinstance(emb, str):
+                # Prefer JSON for speed; fallback to literal_eval for legacy formatting.
+                try:
+                    parsed = json.loads(emb)
+                except json.JSONDecodeError:
+                    parsed = ast.literal_eval(emb)
+            else:
+                parsed = emb
+
+            parsed_embeddings.append(np.asarray(parsed, dtype=np.float32))
+
+        return np.vstack(parsed_embeddings).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _extract_embeddings_from_df(df: pd.DataFrame) -> np.ndarray:
+        """Extract embedding matrix from a dataframe across supported layouts.
+        
+        Optimized for large parquet files with string-encoded embeddings.
+        Uses json.loads() which is ~10x faster than eval() or ast.literal_eval.
+        """
+        feat_cols = EmbeddingLoader._sorted_feature_columns(list(df.columns))
+        if feat_cols:
+            return df[feat_cols].to_numpy(dtype=np.float32, copy=False)
+
+        if 'embedding' in df.columns:
+            return EmbeddingLoader._parse_embedding_series(df['embedding'])
+
+        # Fallback to all numeric columns if no explicit embedding layout is found.
+        numeric_cols = df.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
+        return df[numeric_cols].to_numpy(dtype=np.float32, copy=False)
     
     @staticmethod
     def load_embedding(file_path: Union[str, Path], indices: Optional[List[int]] = None) -> np.ndarray:
@@ -125,12 +181,10 @@ class EmbeddingLoader:
     
     @staticmethod
     def _load_parquet(file_path: Path, indices: Optional[List[int]] = None) -> np.ndarray:
-        """Load from parquet format (assumes embedding columns are numeric)."""
+        """Load from parquet format (supports `embedding` column or numeric features)."""
         df = pd.read_parquet(file_path)
-        # Filter to numeric columns (assumes these are embeddings)
-        numeric_cols = df.select_dtypes(include=['float64', 'float32']).columns
-        embeddings = df[numeric_cols].values
-        
+        embeddings = EmbeddingLoader._extract_embeddings_from_df(df)
+
         if indices is not None:
             embeddings = embeddings[indices]
         return embeddings
@@ -139,19 +193,8 @@ class EmbeddingLoader:
     def _load_csv(file_path: Path, indices: Optional[List[int]] = None) -> np.ndarray:
         """Load from CSV format (handles both numeric columns and string embeddings)."""
         df = pd.read_csv(file_path)
-        
-        # Check if there's an 'embedding' column with string representations
-        if 'embedding' in df.columns:
-            # Parse string representations like "[1.0, 2.0, 3.0]" to arrays
-            import ast
-            embeddings = np.array([ast.literal_eval(emb) for emb in df['embedding']], dtype=np.float32)
-        else:
-            # Old format: index column + numeric columns
-            if df.columns[0] in ['label', 'id'] or df.iloc[:, 0].dtype == 'object':
-                # First column is labels, rest are embeddings
-                embeddings = df.iloc[:, 1:].values
-            else:
-                embeddings = df.values
+
+        embeddings = EmbeddingLoader._extract_embeddings_from_df(df)
         
         if indices is not None:
             embeddings = embeddings[indices]
@@ -180,35 +223,29 @@ class EmbeddingLoader:
             df = pd.read_parquet(file_path)
             if key_column in df.columns:
                 ids = df[key_column]
-                numeric_cols = df.select_dtypes(include=['float64', 'float32']).columns
-                embeddings = df[numeric_cols].values
+            elif 'label' in df.columns:
+                ids = df['label']
+            elif 'id' in df.columns:
+                ids = df['id']
             else:
                 ids = pd.Index(range(len(df)))
-                numeric_cols = df.select_dtypes(include=['float64', 'float32']).columns
-                embeddings = df[numeric_cols].values
+
+            embeddings = EmbeddingLoader._extract_embeddings_from_df(df)
         elif file_path.suffix == '.csv':
             df = pd.read_csv(file_path)
-            
-            # Handle different CSV formats
-            if 'embedding' in df.columns:
-                # New format: 'label' and 'embedding' columns
-                import ast
-                embeddings = np.array([ast.literal_eval(emb) for emb in df['embedding']], dtype=np.float32)
-                if 'label' in df.columns:
-                    ids = df['label']
-                else:
-                    ids = pd.Index(range(len(df)))
+
+            if key_column in df.columns:
+                ids = df[key_column]
+            elif 'label' in df.columns:
+                ids = df['label']
+            elif 'id' in df.columns:
+                ids = df['id']
+            elif len(df.columns) > 0 and df.iloc[:, 0].dtype == 'object':
+                ids = df.iloc[:, 0]
             else:
-                # Old format: index column + numeric columns
-                if df.columns[0] in ['label', 'id']:
-                    ids = df[df.columns[0]]
-                    numeric_cols = df.select_dtypes(include=['float64', 'float32']).columns
-                    embeddings = df[numeric_cols].values
-                else:
-                    # First column is index
-                    ids = df.iloc[:, 0]
-                    numeric_cols = df.iloc[:, 1:].select_dtypes(include=['float64', 'float32']).columns
-                    embeddings = df[numeric_cols].values
+                ids = pd.Index(range(len(df)))
+
+            embeddings = EmbeddingLoader._extract_embeddings_from_df(df)
         else:
             embeddings = EmbeddingLoader.load_embedding(file_path)
             ids = pd.Index(range(len(embeddings)))
@@ -248,6 +285,12 @@ class MappingHandler:
     
     def _create_indices(self) -> None:
         """Create index mappings for efficient lookup."""
+        # Normalize peptide identifiers so mapping uses peptide sequence only,
+        # regardless of whether input values contain a leading uniprot prefix.
+        self.mapping['pep_seq'] = self.mapping['pep_seq'].astype(str).apply(
+            MergeTablesCreator.normalize_peptide_identifier
+        )
+
         # Create full cysteine ID (uniprot_id_residue) for each row
         self.mapping['cys_full_id'] = self.mapping['uniprot_id'] + '_' + self.mapping['residue']
         
@@ -351,6 +394,15 @@ class MergeTablesCreator:
         self.cys_ids = np.array(cys_ids)
         self.pep_ids = np.array(pep_ids)
         self.prot_ids = np.array(protein_ids)
+
+        # Build normalized peptide lookup so mapping pep_seq (sequence-only)
+        # can match peptide embedding labels with or without uniprot prefix.
+        self.pep_lookup = {}
+        for idx, pid in enumerate(pep_ids):
+            normalized_id = self.normalize_peptide_identifier(pid)
+            if normalized_id not in self.pep_lookup:
+                self.pep_lookup[normalized_id] = []
+            self.pep_lookup[normalized_id].append(idx)
         
         # Create mappings for index lookup
         self.cys_idx_map = {cid: idx for idx, cid in enumerate(cys_ids)}
@@ -365,13 +417,33 @@ class MergeTablesCreator:
         logger.info(f"  Peptide embeddings: {self.pep_emb.shape}")
         logger.info(f"  Protein embeddings: {self.prot_emb.shape}")
         logger.info(f"  Aggregation method: {self.aggregation_method}")
+
+    @staticmethod
+    def normalize_peptide_identifier(peptide_id: str) -> str:
+        """Normalize peptide IDs to sequence-only values.
+
+        Accepts either `PEPTIDESEQ` or `UNIPROT_PEPTIDESEQ` and returns
+        the peptide sequence component used by mapping `pep_seq`.
+        """
+        peptide_id = str(peptide_id)
+        if '_' in peptide_id:
+            return peptide_id.split('_', 1)[1]
+        return peptide_id
+
+    @staticmethod
+    def _extract_residue_from_cys_id(cys_id: str) -> str:
+        """Extract residue token from cysteine id formatted as UNIPROT_RESIDUE."""
+        cys_id = str(cys_id)
+        if '_' in cys_id:
+            return cys_id.split('_', 1)[1]
+        return cys_id
     
     def create_cys_pep_table(self) -> pd.DataFrame:
         """
         Create table of cysteine + peptide embeddings.
         
         Returns:
-            DataFrame with columns: label, aggregation_method, embedding
+            DataFrame with columns: label, feat_1..feat_N
         """
         logger.info("Creating cysteine + peptide merged table...")
         
@@ -397,8 +469,9 @@ class MergeTablesCreator:
             # Get peptide embeddings and aggregate
             pep_embs = []
             for pep_seq in pep_seqs_to_use:
-                pep_idx = self.pep_idx_map.get(pep_seq)
-                if pep_idx is not None:
+                normalized_pep_seq = self.normalize_peptide_identifier(pep_seq)
+                pep_indices = self.pep_lookup.get(normalized_pep_seq, [])
+                for pep_idx in pep_indices:
                     pep_embs.append(self.pep_emb[pep_idx])
             
             if not pep_embs:
@@ -413,9 +486,9 @@ class MergeTablesCreator:
             if merged_emb is None:
                 continue
             
+            first_pep = self.normalize_peptide_identifier(pep_seqs_to_use[0])
             rows.append({
-                'label': cys_id,
-                'aggregation_method': self.aggregation_method,
+                'label': f"{cys_id}_{first_pep}",
                 'embedding': merged_emb
             })
         
@@ -430,13 +503,10 @@ class MergeTablesCreator:
         embedding_df = pd.DataFrame(
             df['embedding'].tolist(),
             index=df.index,
-            columns=[f'feat_{i}' for i in range(df['embedding'].iloc[0].shape[0])]
+            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
         )
         
-        result = pd.concat(
-            [df[['label', 'aggregation_method']], embedding_df],
-            axis=1
-        )
+        result = pd.concat([df[['label']], embedding_df], axis=1)
         
         logger.info(f"Created cys+pep table with {len(result)} rows and {result.shape[1]} columns")
         return result
@@ -446,7 +516,7 @@ class MergeTablesCreator:
         Create table of cysteine + peptide + protein embeddings.
         
         Returns:
-            DataFrame with columns: cysteine_label, peptide_label, uniprot_id, embedding
+            DataFrame with columns: label, feat_1..feat_N
         """
         logger.info("Creating cysteine + peptide + protein merged table...")
         
@@ -462,28 +532,31 @@ class MergeTablesCreator:
             
             # Process each (peptide, protein) pair
             for pep_seq, prot_id in cys_pep_prot:
-                pep_idx = self.pep_idx_map.get(pep_seq)
                 prot_idx = self.prot_idx_map.get(prot_id)
-                
-                if pep_idx is None or prot_idx is None:
-                    continue
-                
-                pep_emb = self.pep_emb[pep_idx]
-                prot_emb = self.prot_emb[prot_idx]
-                
-                # Concatenate embeddings
-                merged_emb = EmbeddingAggregator.concatenate_embeddings(
-                    [cys_emb, pep_emb, prot_emb]
+
+                pep_indices = self.pep_lookup.get(
+                    self.normalize_peptide_identifier(pep_seq), []
                 )
-                if merged_emb is None:
+
+                if not pep_indices or prot_idx is None:
                     continue
-                
-                rows.append({
-                    'cysteine_label': cys_id,
-                    'peptide_label': pep_seq,
-                    'uniprot_id': prot_id,
-                    'embedding': merged_emb
-                })
+
+                prot_emb = self.prot_emb[prot_idx]
+
+                for pep_idx in pep_indices:
+                    pep_emb = self.pep_emb[pep_idx]
+
+                    # Concatenate embeddings
+                    merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                        [cys_emb, pep_emb, prot_emb]
+                    )
+                    if merged_emb is None:
+                        continue
+
+                    rows.append({
+                        'label': f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}_{self.normalize_peptide_identifier(pep_seq)}",
+                        'embedding': merged_emb
+                    })
         
         # Convert to DataFrame
         if not rows:
@@ -496,13 +569,10 @@ class MergeTablesCreator:
         embedding_df = pd.DataFrame(
             df['embedding'].tolist(),
             index=df.index,
-            columns=[f'feat_{i}' for i in range(df['embedding'].iloc[0].shape[0])]
+            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
         )
         
-        result = pd.concat(
-            [df[['cysteine_label', 'peptide_label', 'uniprot_id']], embedding_df],
-            axis=1
-        )
+        result = pd.concat([df[['label']], embedding_df], axis=1)
         
         logger.info(f"Created cys+pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
@@ -512,7 +582,7 @@ class MergeTablesCreator:
         Create table of cysteine + protein embeddings.
         
         Returns:
-            DataFrame with columns: label, uniprot_id, embedding
+            DataFrame with columns: label, feat_1..feat_N
         """
         logger.info("Creating cysteine + protein merged table...")
         
@@ -540,8 +610,7 @@ class MergeTablesCreator:
                 continue
             
             rows.append({
-                'label': cys_id,
-                'uniprot_id': prot_id,
+                'label': f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}",
                 'embedding': merged_emb
             })
         
@@ -556,13 +625,10 @@ class MergeTablesCreator:
         embedding_df = pd.DataFrame(
             df['embedding'].tolist(),
             index=df.index,
-            columns=[f'feat_{i}' for i in range(df['embedding'].iloc[0].shape[0])]
+            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
         )
         
-        result = pd.concat(
-            [df[['label', 'uniprot_id']], embedding_df],
-            axis=1
-        )
+        result = pd.concat([df[['label']], embedding_df], axis=1)
         
         logger.info(f"Created cys+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
@@ -572,7 +638,7 @@ class MergeTablesCreator:
         Create table of peptide + protein embeddings.
         
         Returns:
-            DataFrame with columns: label, uniprot_id, embedding
+            DataFrame with columns: label, feat_1..feat_N
         """
         logger.info("Creating peptide + protein merged table...")
         
@@ -586,26 +652,30 @@ class MergeTablesCreator:
                           desc="Processing peptide-protein pairs"):
             pep_seq = row['pep_seq']
             prot_id = row['uniprot_id']
-            
-            pep_idx = self.pep_idx_map.get(pep_seq)
+
             prot_idx = self.prot_idx_map.get(prot_id)
-            
-            if pep_idx is None or prot_idx is None:
+
+            pep_indices = self.pep_lookup.get(
+                self.normalize_peptide_identifier(pep_seq), []
+            )
+
+            if not pep_indices or prot_idx is None:
                 continue
-            
-            pep_emb = self.pep_emb[pep_idx]
+
             prot_emb = self.prot_emb[prot_idx]
-            
-            # Concatenate embeddings
-            merged_emb = EmbeddingAggregator.concatenate_embeddings([pep_emb, prot_emb])
-            if merged_emb is None:
-                continue
-            
-            rows.append({
-                'label': pep_seq,
-                'uniprot_id': prot_id,
-                'embedding': merged_emb
-            })
+
+            for pep_idx in pep_indices:
+                pep_emb = self.pep_emb[pep_idx]
+
+                # Concatenate embeddings
+                merged_emb = EmbeddingAggregator.concatenate_embeddings([pep_emb, prot_emb])
+                if merged_emb is None:
+                    continue
+
+                rows.append({
+                    'label': f"{prot_id}_{self.normalize_peptide_identifier(pep_seq)}",
+                    'embedding': merged_emb
+                })
         
         # Convert to DataFrame
         if not rows:
@@ -618,13 +688,10 @@ class MergeTablesCreator:
         embedding_df = pd.DataFrame(
             df['embedding'].tolist(),
             index=df.index,
-            columns=[f'feat_{i}' for i in range(df['embedding'].iloc[0].shape[0])]
+            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
         )
         
-        result = pd.concat(
-            [df[['label', 'uniprot_id']], embedding_df],
-            axis=1
-        )
+        result = pd.concat([df[['label']], embedding_df], axis=1)
         
         logger.info(f"Created pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
@@ -678,40 +745,6 @@ def load_embeddings_and_mapping(
     return cys_emb, pep_emb, prot_emb, list(cys_ids), list(pep_ids), list(prot_ids), mapping_df
 
 
-def convert_embeddings_to_string(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert expanded embedding columns (feat_0, feat_1, ...) back to string format.
-    
-    Args:
-        df: DataFrame with expanded embedding columns
-        
-    Returns:
-        DataFrame with 'embedding' column containing string representation
-    """
-    # Find all feat_* columns
-    feat_cols = [col for col in df.columns if col.startswith('feat_')]
-    
-    if not feat_cols:
-        # No embedding columns to convert
-        return df
-    
-    # Get non-feature columns
-    non_feat_cols = [col for col in df.columns if not col.startswith('feat_')]
-    
-    # Convert feature columns back to string format
-    embedding_strs = []
-    for idx, row in df[feat_cols].iterrows():
-        embedding_list = row[feat_cols].tolist()
-        embedding_str = str(embedding_list)
-        embedding_strs.append(embedding_str)
-    
-    # Create new DataFrame with embeddings as strings
-    result_df = df[non_feat_cols].copy()
-    result_df['embedding'] = embedding_strs
-    
-    return result_df
-
-
 def save_merged_tables(
     tables: Dict[str, pd.DataFrame],
     output_dir: Path,
@@ -735,8 +768,8 @@ def save_merged_tables(
             logger.warning(f"Skipping empty table: {table_name}")
             continue
         
-        # Convert embeddings to string format before saving
-        df_to_save = convert_embeddings_to_string(df)
+        # Keep embeddings in expanded feature-column format (feat_1..feat_N).
+        df_to_save = df
         
         if format in ['parquet', 'both']:
             output_path = output_dir / f"{table_name}.parquet"

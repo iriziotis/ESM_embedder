@@ -384,15 +384,11 @@ def generate_embeddings(df: pd.DataFrame,
             skipped_count += 1
             continue
         
-        # Prepare output with rounded embeddings (3 decimals)
-        rounded_embedding = np.round(embedding, 3)
-        # Format embedding as string with exactly 3 decimal places
-        embedding_str = '[' + ', '.join(f'{x:.3f}' for x in rounded_embedding) + ']'
         output_data = {
             'label': label,
-            'uniprot_id': uniprot_id if pd.notna(uniprot_id) else '',
-            'embedding': embedding_str
+            'uniprot_id': uniprot_id if pd.notna(uniprot_id) else ''
         }
+        output_data.update(embedding_to_feature_dict(embedding))
         
         if output_format == 'parquet':
             # Collect records for batch writing
@@ -417,6 +413,15 @@ def generate_embeddings(df: pd.DataFrame,
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     print(f"\nCompleted: {processed_count} sequences processed, {skipped_count} skipped")
+
+
+def embedding_to_feature_dict(embedding: np.ndarray, prefix: str = 'feat_') -> dict:
+    """Convert embedding vector to expanded feature columns (feat_1, feat_2, ...)."""
+    rounded_embedding = np.round(embedding, 3)
+    return {
+        f'{prefix}{i + 1}': float(value)
+        for i, value in enumerate(rounded_embedding)
+    }
 
 
 # ============================================================================
