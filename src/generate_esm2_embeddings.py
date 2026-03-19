@@ -10,15 +10,25 @@ Licensed under the MIT license.
 """
 
 import argparse
+import csv
 import pandas as pd
 import numpy as np
 import torch
 import sys
+import re
 from pathlib import Path
+from typing import Dict, Iterable, Iterator, Optional, Tuple
 from Bio import SeqIO
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
 import esm
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    pa = None
+    pq = None
 
 
 # ============================================================================
@@ -185,6 +195,177 @@ def format_sequence_dataframe(df: pd.DataFrame, residue_type: str = 'C') -> pd.D
 # Embedding Generation Functions
 # ============================================================================
 
+def extract_residue_metadata(residue_value: object) -> Tuple[int, str]:
+    """Extract 1-based residue index and residue token from a residue label such as C45."""
+    residue_str = str(residue_value)
+    residue_match = re.fullmatch(r'([A-Za-z])(\d+)', residue_str)
+    if residue_match is None:
+        raise ValueError(
+            f"Invalid residue value '{residue_value}'. Expected format like 'C45'."
+        )
+
+    residue_type, residue_idx = residue_match.groups()
+    return int(residue_idx), residue_type.upper()
+
+
+def iter_sequence_csv(
+    csv_path: str,
+    target: str,
+    residue_type: str = 'C',
+    all_residues: bool = True,
+    chunksize: int = 1000,
+) -> Iterator[Dict[str, object]]:
+    """Stream formatted records from a CSV input file."""
+    header_df = pd.read_csv(csv_path, nrows=0)
+
+    if target in ['sequence', 'peptide']:
+        required_cols = {'uniprot_id', 'pep_seq'}
+    elif all_residues:
+        required_cols = {'uniprot_id', 'pep_seq'}
+    else:
+        required_cols = {'uniprot_id', 'pep_seq', 'residue'}
+
+    if not required_cols.issubset(header_df.columns):
+        raise ValueError(
+            f"CSV must contain columns: {required_cols}. Found: {set(header_df.columns)}"
+        )
+
+    residue_type = residue_type.upper()
+    for chunk in pd.read_csv(csv_path, chunksize=chunksize):
+        chunk = chunk.dropna(subset=['pep_seq'])
+
+        for row in chunk.itertuples(index=False):
+            uniprot_id = str(getattr(row, 'uniprot_id'))
+            sequence = str(getattr(row, 'pep_seq'))
+
+            if target == 'sequence':
+                yield {
+                    'label': uniprot_id,
+                    'sequence': sequence,
+                    'uniprot_id': uniprot_id,
+                }
+                continue
+
+            if target == 'peptide':
+                yield {
+                    'label': f"{uniprot_id}_{sequence}",
+                    'sequence': sequence,
+                    'uniprot_id': uniprot_id,
+                }
+                continue
+
+            if all_residues:
+                found_residue = False
+                for pos, char in enumerate(sequence, start=1):
+                    if char == residue_type:
+                        found_residue = True
+                        yield {
+                            'label': f"{uniprot_id}_{residue_type}{pos}",
+                            'sequence': sequence,
+                            'residue_of_interest_idx': pos,
+                            'residue_type': residue_type,
+                            'uniprot_id': uniprot_id,
+                        }
+
+                if not found_residue:
+                    continue
+                continue
+
+            residue_idx, row_residue_type = extract_residue_metadata(getattr(row, 'residue'))
+            yield {
+                'label': f"{uniprot_id}_{getattr(row, 'residue')}",
+                'sequence': sequence,
+                'residue_of_interest_idx': residue_idx,
+                'residue_type': row_residue_type,
+                'uniprot_id': uniprot_id,
+            }
+
+
+def iter_sequence_fasta(
+    fasta_path: str,
+    target: str,
+    residue_type: str = 'C',
+) -> Iterator[Dict[str, object]]:
+    """Stream formatted records from a FASTA input file."""
+    residue_type = residue_type.upper()
+
+    for record in SeqIO.parse(fasta_path, 'fasta'):
+        header_parts = record.id.split('|')
+        uniprot_id = header_parts[1] if len(header_parts) >= 2 else record.id
+        sequence = str(record.seq)
+
+        if target == 'sequence':
+            yield {
+                'label': uniprot_id,
+                'sequence': sequence,
+                'uniprot_id': uniprot_id,
+            }
+            continue
+
+        if target == 'peptide':
+            yield {
+                'label': f"{uniprot_id}_{sequence}",
+                'sequence': sequence,
+                'uniprot_id': uniprot_id,
+            }
+            continue
+
+        for pos, char in enumerate(sequence, start=1):
+            if char == residue_type:
+                yield {
+                    'label': f"{uniprot_id}_{residue_type}{pos}",
+                    'sequence': sequence,
+                    'residue_of_interest_idx': pos,
+                    'residue_type': residue_type,
+                    'uniprot_id': uniprot_id,
+                }
+
+
+def iter_input_records(
+    seq_file: str,
+    target: str,
+    residue_type: str = 'C',
+    all_residues: bool = True,
+    csv_chunksize: int = 1000,
+) -> Iterator[Dict[str, object]]:
+    """Create a streaming iterator over formatted input records."""
+    if seq_file.endswith('.csv'):
+        return iter_sequence_csv(
+            seq_file,
+            target=target,
+            residue_type=residue_type,
+            all_residues=all_residues,
+            chunksize=csv_chunksize,
+        )
+
+    if seq_file.endswith('.fasta') or seq_file.endswith('.fa'):
+        return iter_sequence_fasta(seq_file, target=target, residue_type=residue_type)
+
+    raise ValueError("Input file must be .csv or .fasta")
+
+
+def flush_parquet_records(
+    parquet_writer: Optional[object],
+    records: List[Dict[str, object]],
+    output_path: Path,
+) -> Optional[object]:
+    """Flush buffered records to parquet without holding the full output in memory."""
+    if not records:
+        return parquet_writer
+
+    if pa is None or pq is None:
+        raise ImportError(
+            "pyarrow is required for parquet output. Install it with `pip install pyarrow`."
+        )
+
+    table = pa.Table.from_pylist(records)
+    if parquet_writer is None:
+        parquet_writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
+
+    parquet_writer.write_table(table)
+    records.clear()
+    return parquet_writer
+
 def process_batch(model, data_tuple, batch_converter, repr_layer_id: int) -> np.ndarray:
     """
     Generate embeddings for a sequence using ESM-2 model.
@@ -285,7 +466,7 @@ def get_residue_embedding(residue_idx: int, token_representations: np.ndarray, s
 # Main Processing Function
 # ============================================================================
 
-def generate_embeddings(df: pd.DataFrame, 
+def generate_embeddings(records: Iterable[Dict[str, object]], 
                        output_file: str,
                        model: object,
                        batch_converter: object,
@@ -293,12 +474,13 @@ def generate_embeddings(df: pd.DataFrame,
                        max_seq_length: int = 1024,
                        min_seq_length: int = 0,
                        target: str = 'sequence',
-                       output_format: str = 'csv') -> None:
+                       output_format: str = 'csv',
+                       parquet_chunk_size: int = 256) -> None:
     """
     Generate embeddings for all sequences in a dataframe and write to file.
     
     Args:
-        df: DataFrame with columns: label, sequence, residue_of_interest_idx, residue_type, uniprot_id
+        records: Iterable of formatted sequence records
         output_file: Path to output file (CSV or Parquet)
         model: ESM-2 model
         batch_converter: Batch converter
@@ -310,108 +492,103 @@ def generate_embeddings(df: pd.DataFrame,
     """
     # Clean up old output file to ensure fresh start (no appending to previous runs)
     output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
     
     skipped_count = 0
     processed_count = 0
-    write_header = True  # Always write header since we're starting fresh
-    
-    # For parquet, collect all records in memory
-    all_records = [] if output_format == 'parquet' else None
-    
-    labels = df['label'].tolist()
-    sequences = df['sequence'].tolist()
-    
-    # Handle residue information (may not exist for sequence-only mode)
-    if 'residue_of_interest_idx' in df.columns:
-        residue_indices = df['residue_of_interest_idx'].tolist()
-    else:
-        residue_indices = [None] * len(df)
-    
-    # Get residue types, defaulting to 'C' if column doesn't exist
-    if 'residue_type' in df.columns:
-        residue_types = df['residue_type'].tolist()
-    else:
-        residue_types = ['C'] * len(df)
-    
-    uniprot_ids = df['uniprot_id'].tolist()
+    csv_file = None
+    csv_writer = None
+    parquet_writer = None
+    parquet_records: List[Dict[str, object]] = []
     
     # Track cached sequence embeddings to avoid recalculation
     cached_sequence = None
     cached_token_representations = None
-    
-    for i, (label, seq, residue_idx, residue_type, uniprot_id) in enumerate(
-        zip(labels, sequences, residue_indices, residue_types, uniprot_ids)
-    ):
-        # Skip if sequence length is out of range
-        if not (min_seq_length < len(seq) < max_seq_length):
-            print(f"[{i+1}/{len(df)}] Skipping {label} - length {len(seq)} outside range "
-                  f"[{min_seq_length}, {max_seq_length})")
-            skipped_count += 1
-            continue
-        
-        # Only calculate token representations if this is a new sequence
-        if seq != cached_sequence:
-            # Clear previous cache to free memory
-            cached_token_representations = None
-            cached_sequence = seq
-            
-            # Generate embeddings for the new sequence
-            print(f"[{i+1}/{len(df)}] Processing {label} (length={len(seq)})")
-            token_representations = process_batch(
-                model, (label, seq), batch_converter, repr_layer_id
-            )
-            # Cache for reuse with other residues from same sequence
-            cached_token_representations = token_representations
-        else:
-            # Reuse cached token representations for this sequence
-            token_representations = cached_token_representations
-            print(f"[{i+1}/{len(df)}] Processing {label} (cached - length={len(seq)})")
-        
-        # Generate embedding based on target
-        try:
-            if target == 'residue':
-                embedding = get_residue_embedding(residue_idx, token_representations, sequence=seq, residue_type=residue_type)
-            elif target == 'sequence':
-                embedding = get_whole_sequence_embedding(token_representations, method='mean')
-            elif target == 'peptide':
-                embedding = get_whole_sequence_embedding(token_representations, method='mean')
+
+    try:
+        for i, record in enumerate(records, start=1):
+            label = str(record['label'])
+            seq = str(record['sequence'])
+            residue_idx = record.get('residue_of_interest_idx')
+            residue_type = str(record.get('residue_type', 'C')).upper()
+            uniprot_id = record.get('uniprot_id', '')
+
+            if not (min_seq_length < len(seq) < max_seq_length):
+                print(
+                    f"[{i}] Skipping {label} - length {len(seq)} outside range "
+                    f"[{min_seq_length}, {max_seq_length})"
+                )
+                skipped_count += 1
+                continue
+
+            if seq != cached_sequence:
+                cached_token_representations = None
+                cached_sequence = seq
+
+                print(f"[{i}] Processing {label} (length={len(seq)})")
+                token_representations = process_batch(
+                    model, (label, seq), batch_converter, repr_layer_id
+                )
+                cached_token_representations = token_representations
             else:
-                raise ValueError(f"Unknown target: {target}")
-        except ValueError as e:
-            print(f"[{i+1}/{len(df)}] SKIPPING {label} - Invalid residue specification: {str(e)}", file=sys.stderr)
-            skipped_count += 1
-            continue
-        
-        output_data = {
-            'label': label,
-            'uniprot_id': uniprot_id if pd.notna(uniprot_id) else ''
-        }
-        output_data.update(embedding_to_feature_dict(embedding))
-        
+                token_representations = cached_token_representations
+                print(f"[{i}] Processing {label} (cached - length={len(seq)})")
+
+            try:
+                if target == 'residue':
+                    embedding = get_residue_embedding(
+                        residue_idx,
+                        token_representations,
+                        sequence=seq,
+                        residue_type=residue_type,
+                    )
+                elif target in ['sequence', 'peptide']:
+                    embedding = get_whole_sequence_embedding(token_representations, method='mean')
+                else:
+                    raise ValueError(f"Unknown target: {target}")
+            except ValueError as e:
+                print(
+                    f"[{i}] SKIPPING {label} - Invalid residue specification: {str(e)}",
+                    file=sys.stderr,
+                )
+                skipped_count += 1
+                continue
+
+            output_data = {'index': label}
+            output_data.update(embedding_to_feature_dict(embedding))
+
+            if output_format == 'parquet':
+                parquet_records.append(output_data)
+                if len(parquet_records) >= parquet_chunk_size:
+                    parquet_writer = flush_parquet_records(
+                        parquet_writer,
+                        parquet_records,
+                        output_path,
+                    )
+            else:
+                if csv_writer is None:
+                    csv_file = output_path.open('w', newline='')
+                    csv_writer = csv.DictWriter(csv_file, fieldnames=list(output_data.keys()))
+                    csv_writer.writeheader()
+                csv_writer.writerow(output_data)
+
+            processed_count += 1
+
+            del embedding
+
         if output_format == 'parquet':
-            # Collect records for batch writing
-            all_records.append(output_data)
-        else:
-            # Write to CSV incrementally
-            output_df = pd.DataFrame([output_data])
-            mode = 'w' if write_header else 'a'
-            header = write_header
-            output_df.to_csv(output_file, mode=mode, header=header, index=False)
-            write_header = False
-        
-        processed_count += 1
-    
-    # Write parquet file if that format was selected
-    if output_format == 'parquet' and all_records:
-        output_df = pd.DataFrame(all_records)
-        output_df.to_parquet(output_file, index=False, engine='pyarrow')
-    
-    # Clean up cached embeddings
-    cached_token_representations = None
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
+            parquet_writer = flush_parquet_records(parquet_writer, parquet_records, output_path)
+    finally:
+        cached_token_representations = None
+        if parquet_writer is not None:
+            parquet_writer.close()
+        if csv_file is not None:
+            csv_file.close()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     print(f"\nCompleted: {processed_count} sequences processed, {skipped_count} skipped")
 
 
@@ -516,74 +693,16 @@ def main(args):
         print(f"\nWARNING: --residue_type '{args.residue_type}' is ignored when --target is '{args.target}'")
         print("Residue-level embeddings will not be calculated.")
     
-    # Load and validate input data
-    print(f"\nLoading sequences from {args.seq_file}...")
-    
-    if args.target in ['sequence', 'peptide']:
-        # For sequence and peptide targets, load without residue processing
-        if args.seq_file.endswith('.csv'):
-            df = pd.read_csv(args.seq_file)
-            # Validate required columns
-            required_cols = {'uniprot_id', 'pep_seq'}
-            if not required_cols.issubset(df.columns):
-                raise ValueError(
-                    f"CSV must contain columns: {required_cols}. "
-                    f"Found: {set(df.columns)}"
-                )
-            # Filter out rows with missing sequences
-            df = df.dropna(subset=['pep_seq'])
-            # Create label based on target
-            if args.target == 'peptide':
-                # For peptide target, label is uniprot_id_sequence
-                df['label'] = df['uniprot_id'].astype(str) + '_' + df['pep_seq'].astype(str)
-            else:
-                # For sequence target, label is just uniprot_id
-                df['label'] = df['uniprot_id'].astype(str)
-            # Rename pep_seq to sequence
-            df_formatted = df[['label', 'pep_seq', 'uniprot_id']].copy()
-            df_formatted.columns = ['label', 'sequence', 'uniprot_id']
-        elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
-            records = list(SeqIO.parse(args.seq_file, 'fasta'))
-            data = []
-            for record in records:
-                header_parts = record.id.split('|')
-                uniprot_id = header_parts[1] if len(header_parts) >= 2 else record.id
-                seq = str(record.seq)
-                if args.target == 'peptide':
-                    label = f"{uniprot_id}_{seq}"
-                else:
-                    label = uniprot_id
-                data.append({
-                    'label': label,
-                    'sequence': seq,
-                    'uniprot_id': uniprot_id
-                })
-            df_formatted = pd.DataFrame(data)
-        else:
-            raise ValueError("Input file must be .csv or .fasta")
-        
-        print(f"Loaded {len(df_formatted)} sequences ({args.target} mode)")
-    else:
-        # For residue target, use residue processing
-        if args.seq_file.endswith('.csv'):
-            df = load_sequence_csv(args.seq_file, residue_type=args.residue_type, all_residues=args.all_residues)
-        elif args.seq_file.endswith('.fasta') or args.seq_file.endswith('.fa'):
-            df = load_sequence_fasta(args.seq_file, residue_type=args.residue_type)
-        else:
-            raise ValueError("Input file must be .csv or .fasta")
-        
-        if args.all_residues:
-            print(f"Loaded {len(df)} residue instances from sequences")
-        else:
-            print(f"Loaded {len(df)} sequences")
-        
-        # Format data (only needed when not using all_residues from CSV)
-        if args.seq_file.endswith('.csv') and not args.all_residues:
-            print(f"\nFormatting sequences for target: {args.target}...")
-            df_formatted = format_sequence_dataframe(df, residue_type=args.residue_type)
-        else:
-            # Already formatted for FASTA or all_residues mode
-            df_formatted = df
+    print(f"\nStreaming sequences from {args.seq_file}...")
+    if args.target == 'residue' and args.all_residues:
+        print(f"Residue mode enabled; expanding {args.residue_type.upper()} positions lazily during processing")
+
+    input_records = iter_input_records(
+        args.seq_file,
+        target=args.target,
+        residue_type=args.residue_type,
+        all_residues=args.all_residues,
+    )
     
     # Load model
     print(f"\nLoading ESM-2 model: {args.model_name}...")
@@ -598,7 +717,7 @@ def main(args):
     print(f"\nGenerating embeddings with target: {args.target}...")
     print(f"Output format: {args.output_format}")
     generate_embeddings(
-        df_formatted,
+        input_records,
         output_file=args.output_file,
         model=model,
         batch_converter=batch_converter,

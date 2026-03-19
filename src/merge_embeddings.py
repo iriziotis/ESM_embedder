@@ -27,16 +27,21 @@ Usage:
 import argparse
 import logging
 import sys
+from itertools import chain
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, Iterable, Iterator, List, Tuple, Optional, Union
 import warnings
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from multiprocessing import Pool, cpu_count
-from functools import partial
 from tqdm import tqdm
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    pa = None
+    pq = None
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -223,6 +228,8 @@ class EmbeddingLoader:
             df = pd.read_parquet(file_path)
             if key_column in df.columns:
                 ids = df[key_column]
+            elif 'index' in df.columns:
+                ids = df['index']
             elif 'label' in df.columns:
                 ids = df['label']
             elif 'id' in df.columns:
@@ -236,6 +243,8 @@ class EmbeddingLoader:
 
             if key_column in df.columns:
                 ids = df[key_column]
+            elif 'index' in df.columns:
+                ids = df['index']
             elif 'label' in df.columns:
                 ids = df['label']
             elif 'id' in df.columns:
@@ -293,30 +302,32 @@ class MappingHandler:
 
         # Create full cysteine ID (uniprot_id_residue) for each row
         self.mapping['cys_full_id'] = self.mapping['uniprot_id'] + '_' + self.mapping['residue']
-        
-        # Cysteine (full ID) to peptides mapping
-        self.cys_to_peps = self.mapping.groupby('cys_full_id')['pep_seq'].apply(list).to_dict()
-        
-        # Cysteine (full ID) to protein mapping (though it's redundant, keeps consistency)
-        self.cys_to_proteins = self.mapping.groupby('cys_full_id')['uniprot_id'].apply(
-            lambda x: list(set(x))
-        ).to_dict()
-        
-        # Also keep residue-based lookups for backward compatibility
-        self.residue_to_peps = self.mapping.groupby('residue')['pep_seq'].apply(list).to_dict()
-        self.residue_to_proteins = self.mapping.groupby('residue')['uniprot_id'].apply(
-            lambda x: list(set(x))
-        ).to_dict()
-        
-        # Peptide to proteins mapping
-        self.pep_to_proteins = self.mapping.groupby('pep_seq')['uniprot_id'].apply(
-            lambda x: list(set(x))
-        ).to_dict()
-        
-        # Cysteine to (peptide, protein) pairs - using full ID
-        self.cys_to_pep_prot = self.mapping.groupby('cys_full_id', group_keys=False).apply(
-            lambda x: list(zip(x['pep_seq'], x['uniprot_id'])), include_groups=False
-        ).to_dict()
+
+        mapping_pairs = self.mapping[['cys_full_id', 'pep_seq', 'uniprot_id']].drop_duplicates()
+
+        self.cys_to_peps = {
+            cys_id: group['pep_seq'].tolist()
+            for cys_id, group in mapping_pairs.groupby('cys_full_id', sort=False)
+        }
+        self.cys_to_shortest_pep = {
+            cys_id: min(peptides, key=len)
+            for cys_id, peptides in self.cys_to_peps.items()
+            if peptides
+        }
+        self.cys_to_proteins = {
+            cys_id: group['uniprot_id'].tolist()
+            for cys_id, group in mapping_pairs.groupby('cys_full_id', sort=False)
+        }
+        self.cys_to_pep_prot = {
+            cys_id: list(group[['pep_seq', 'uniprot_id']].itertuples(index=False, name=None))
+            for cys_id, group in mapping_pairs.groupby('cys_full_id', sort=False)
+        }
+        self.cys_prot_pairs = list(
+            mapping_pairs[['cys_full_id', 'uniprot_id']].drop_duplicates().itertuples(index=False, name=None)
+        )
+        self.pep_prot_pairs = list(
+            mapping_pairs[['pep_seq', 'uniprot_id']].drop_duplicates().itertuples(index=False, name=None)
+        )
     
     def get_peptides_for_cysteine(self, cys_id: str) -> List[str]:
         """Get all peptides containing a cysteine."""
@@ -328,14 +339,7 @@ class MappingHandler:
     
     def get_shortest_peptide(self, cys_id: str) -> Optional[str]:
         """Get shortest peptide containing cysteine."""
-        peps = self.get_peptides_for_cysteine(cys_id)
-        if not peps:
-            return None
-        return min(peps, key=len)
-    
-    def get_proteins_for_peptide(self, pep_seq: str) -> List[str]:
-        """Get all proteins containing a peptide."""
-        return self.pep_to_proteins.get(pep_seq, [])
+        return self.cys_to_shortest_pep.get(cys_id)
 
 
 class EmbeddingAggregator:
@@ -437,6 +441,149 @@ class MergeTablesCreator:
         if '_' in cys_id:
             return cys_id.split('_', 1)[1]
         return cys_id
+
+    @staticmethod
+    def _rows_to_dataframe(rows: Iterable[Tuple[str, np.ndarray]]) -> pd.DataFrame:
+        """Materialize streamed rows into a dataframe for compatibility with the public API."""
+        materialized_rows = list(rows)
+        if not materialized_rows:
+            return pd.DataFrame()
+
+        labels = [label for label, _ in materialized_rows]
+        embeddings = np.vstack([
+            np.asarray(embedding, dtype=np.float32) for _, embedding in materialized_rows
+        ])
+        embedding_df = pd.DataFrame(
+            embeddings,
+            columns=[f'feat_{i + 1}' for i in range(embeddings.shape[1])],
+        )
+        embedding_df.insert(0, 'index', labels)
+        return embedding_df
+
+    def _collect_peptide_embeddings(self, peptide_ids: List[str]) -> Optional[np.ndarray]:
+        """Resolve peptide IDs to embeddings and aggregate them when needed."""
+        peptide_embeddings: List[np.ndarray] = []
+        for peptide_id in peptide_ids:
+            normalized_peptide = self.normalize_peptide_identifier(peptide_id)
+            for pep_idx in self.pep_lookup.get(normalized_peptide, []):
+                peptide_embeddings.append(self.pep_emb[pep_idx])
+
+        if not peptide_embeddings:
+            return None
+
+        if len(peptide_embeddings) == 1:
+            return peptide_embeddings[0]
+
+        return EmbeddingAggregator.average_embeddings(
+            np.asarray(peptide_embeddings, dtype=np.float32)
+        )
+
+    def iter_cys_pep_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield cysteine + peptide merged rows one at a time."""
+        logger.info("Creating cysteine + peptide merged table...")
+
+        for cys_id in tqdm(self.cys_ids, desc="Processing cysteines"):
+            cys_idx = self.cys_idx_map.get(cys_id)
+            if cys_idx is None:
+                continue
+
+            if self.aggregation_method == 'shortest':
+                shortest_peptide = self.mapping.get_shortest_peptide(cys_id)
+                if shortest_peptide is None:
+                    continue
+                peptide_ids = [shortest_peptide]
+            else:
+                peptide_ids = self.mapping.get_peptides_for_cysteine(cys_id)
+                if not peptide_ids:
+                    continue
+
+            pep_emb = self._collect_peptide_embeddings(peptide_ids)
+            if pep_emb is None:
+                continue
+
+            merged_emb = EmbeddingAggregator.concatenate_embeddings([self.cys_emb[cys_idx], pep_emb])
+            if merged_emb is None:
+                continue
+
+            first_peptide = self.normalize_peptide_identifier(peptide_ids[0])
+            yield f"{cys_id}_{first_peptide}", merged_emb
+
+    def iter_cys_pep_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield cysteine + peptide + protein merged rows one at a time."""
+        logger.info("Creating cysteine + peptide + protein merged table...")
+
+        for cys_id in tqdm(self.cys_ids, desc="Processing cysteines"):
+            cys_idx = self.cys_idx_map.get(cys_id)
+            if cys_idx is None:
+                continue
+
+            cys_emb = self.cys_emb[cys_idx]
+            for pep_seq, prot_id in self.mapping.cys_to_pep_prot.get(cys_id, []):
+                prot_idx = self.prot_idx_map.get(prot_id)
+                pep_indices = self.pep_lookup.get(self.normalize_peptide_identifier(pep_seq), [])
+
+                if prot_idx is None or not pep_indices:
+                    continue
+
+                prot_emb = self.prot_emb[prot_idx]
+                for pep_idx in pep_indices:
+                    merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                        [cys_emb, self.pep_emb[pep_idx], prot_emb]
+                    )
+                    if merged_emb is None:
+                        continue
+
+                    yield (
+                        f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}_"
+                        f"{self.normalize_peptide_identifier(pep_seq)}",
+                        merged_emb,
+                    )
+
+    def iter_cys_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield cysteine + protein merged rows one at a time."""
+        logger.info("Creating cysteine + protein merged table...")
+
+        for cys_id, prot_id in tqdm(
+            self.mapping.cys_prot_pairs,
+            total=len(self.mapping.cys_prot_pairs),
+            desc="Processing cysteine-protein pairs",
+        ):
+            cys_idx = self.cys_idx_map.get(cys_id)
+            prot_idx = self.prot_idx_map.get(prot_id)
+            if cys_idx is None or prot_idx is None:
+                continue
+
+            merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                [self.cys_emb[cys_idx], self.prot_emb[prot_idx]]
+            )
+            if merged_emb is None:
+                continue
+
+            yield f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}", merged_emb
+
+    def iter_pep_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield peptide + protein merged rows one at a time."""
+        logger.info("Creating peptide + protein merged table...")
+
+        for pep_seq, prot_id in tqdm(
+            self.mapping.pep_prot_pairs,
+            total=len(self.mapping.pep_prot_pairs),
+            desc="Processing peptide-protein pairs",
+        ):
+            prot_idx = self.prot_idx_map.get(prot_id)
+            pep_indices = self.pep_lookup.get(self.normalize_peptide_identifier(pep_seq), [])
+            if prot_idx is None or not pep_indices:
+                continue
+
+            prot_emb = self.prot_emb[prot_idx]
+            for pep_idx in pep_indices:
+                merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                    [self.pep_emb[pep_idx], prot_emb]
+                )
+                if merged_emb is None:
+                    continue
+
+                yield f"{prot_id}_{self.normalize_peptide_identifier(pep_seq)}", merged_emb
     
     def create_cys_pep_table(self) -> pd.DataFrame:
         """
@@ -445,70 +592,11 @@ class MergeTablesCreator:
         Returns:
             DataFrame with columns: label, feat_1..feat_N
         """
-        logger.info("Creating cysteine + peptide merged table...")
-        
-        rows = []
-        for cys_id in tqdm(self.cys_ids, desc="Processing cysteines"):
-            pep_seqs = self.mapping.get_peptides_for_cysteine(cys_id)
-            
-            # Get cysteine embedding
-            cys_idx = self.cys_idx_map.get(cys_id)
-            if cys_idx is None:
-                continue
-            cys_emb = self.cys_emb[cys_idx]
-            
-            # Select peptide(s) based on aggregation method
-            if self.aggregation_method == 'shortest':
-                pep_seq = self.mapping.get_shortest_peptide(cys_id)
-                if pep_seq is None:
-                    continue
-                pep_seqs_to_use = [pep_seq]
-            else:  # average
-                pep_seqs_to_use = pep_seqs
-            
-            # Get peptide embeddings and aggregate
-            pep_embs = []
-            for pep_seq in pep_seqs_to_use:
-                normalized_pep_seq = self.normalize_peptide_identifier(pep_seq)
-                pep_indices = self.pep_lookup.get(normalized_pep_seq, [])
-                for pep_idx in pep_indices:
-                    pep_embs.append(self.pep_emb[pep_idx])
-            
-            if not pep_embs:
-                continue
-            
-            pep_emb = EmbeddingAggregator.average_embeddings(np.array(pep_embs))
-            if pep_emb is None:
-                continue
-            
-            # Concatenate embeddings
-            merged_emb = EmbeddingAggregator.concatenate_embeddings([cys_emb, pep_emb])
-            if merged_emb is None:
-                continue
-            
-            first_pep = self.normalize_peptide_identifier(pep_seqs_to_use[0])
-            rows.append({
-                'label': f"{cys_id}_{first_pep}",
-                'embedding': merged_emb
-            })
-        
-        # Convert to DataFrame
-        if not rows:
+        result = self._rows_to_dataframe(self.iter_cys_pep_rows())
+        if result.empty:
             logger.warning("No valid rows created for cys+pep table")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(rows)
-        
-        # Expand embedding columns
-        embedding_df = pd.DataFrame(
-            df['embedding'].tolist(),
-            index=df.index,
-            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
-        )
-        
-        result = pd.concat([df[['label']], embedding_df], axis=1)
-        
-        logger.info(f"Created cys+pep table with {len(result)} rows and {result.shape[1]} columns")
+        else:
+            logger.info(f"Created cys+pep table with {len(result)} rows and {result.shape[1]} columns")
         return result
     
     def create_cys_pep_prot_table(self) -> pd.DataFrame:
@@ -518,63 +606,11 @@ class MergeTablesCreator:
         Returns:
             DataFrame with columns: label, feat_1..feat_N
         """
-        logger.info("Creating cysteine + peptide + protein merged table...")
-        
-        rows = []
-        for cys_id in tqdm(self.cys_ids, desc="Processing cysteines"):
-            cys_pep_prot = self.mapping.cys_to_pep_prot.get(cys_id, [])
-            
-            # Get cysteine embedding
-            cys_idx = self.cys_idx_map.get(cys_id)
-            if cys_idx is None:
-                continue
-            cys_emb = self.cys_emb[cys_idx]
-            
-            # Process each (peptide, protein) pair
-            for pep_seq, prot_id in cys_pep_prot:
-                prot_idx = self.prot_idx_map.get(prot_id)
-
-                pep_indices = self.pep_lookup.get(
-                    self.normalize_peptide_identifier(pep_seq), []
-                )
-
-                if not pep_indices or prot_idx is None:
-                    continue
-
-                prot_emb = self.prot_emb[prot_idx]
-
-                for pep_idx in pep_indices:
-                    pep_emb = self.pep_emb[pep_idx]
-
-                    # Concatenate embeddings
-                    merged_emb = EmbeddingAggregator.concatenate_embeddings(
-                        [cys_emb, pep_emb, prot_emb]
-                    )
-                    if merged_emb is None:
-                        continue
-
-                    rows.append({
-                        'label': f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}_{self.normalize_peptide_identifier(pep_seq)}",
-                        'embedding': merged_emb
-                    })
-        
-        # Convert to DataFrame
-        if not rows:
+        result = self._rows_to_dataframe(self.iter_cys_pep_prot_rows())
+        if result.empty:
             logger.warning("No valid rows created for cys+pep+prot table")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(rows)
-        
-        # Expand embedding columns
-        embedding_df = pd.DataFrame(
-            df['embedding'].tolist(),
-            index=df.index,
-            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
-        )
-        
-        result = pd.concat([df[['label']], embedding_df], axis=1)
-        
-        logger.info(f"Created cys+pep+prot table with {len(result)} rows and {result.shape[1]} columns")
+        else:
+            logger.info(f"Created cys+pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
     
     def create_cys_prot_table(self) -> pd.DataFrame:
@@ -584,53 +620,11 @@ class MergeTablesCreator:
         Returns:
             DataFrame with columns: label, feat_1..feat_N
         """
-        logger.info("Creating cysteine + protein merged table...")
-        
-        rows = []
-        # Get unique cysteine-protein pairs from mapping
-        cys_prot_pairs = self.mapping.mapping[['cys_full_id', 'uniprot_id']].drop_duplicates()
-        
-        for _, row in tqdm(cys_prot_pairs.iterrows(), total=len(cys_prot_pairs), 
-                          desc="Processing cysteine-protein pairs"):
-            cys_id = row['cys_full_id']
-            prot_id = row['uniprot_id']
-            
-            cys_idx = self.cys_idx_map.get(cys_id)
-            prot_idx = self.prot_idx_map.get(prot_id)
-            
-            if cys_idx is None or prot_idx is None:
-                continue
-            
-            cys_emb = self.cys_emb[cys_idx]
-            prot_emb = self.prot_emb[prot_idx]
-            
-            # Concatenate embeddings
-            merged_emb = EmbeddingAggregator.concatenate_embeddings([cys_emb, prot_emb])
-            if merged_emb is None:
-                continue
-            
-            rows.append({
-                'label': f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}",
-                'embedding': merged_emb
-            })
-        
-        # Convert to DataFrame
-        if not rows:
+        result = self._rows_to_dataframe(self.iter_cys_prot_rows())
+        if result.empty:
             logger.warning("No valid rows created for cys+prot table")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(rows)
-        
-        # Expand embedding columns
-        embedding_df = pd.DataFrame(
-            df['embedding'].tolist(),
-            index=df.index,
-            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
-        )
-        
-        result = pd.concat([df[['label']], embedding_df], axis=1)
-        
-        logger.info(f"Created cys+prot table with {len(result)} rows and {result.shape[1]} columns")
+        else:
+            logger.info(f"Created cys+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
     
     def create_pep_prot_table(self) -> pd.DataFrame:
@@ -640,60 +634,11 @@ class MergeTablesCreator:
         Returns:
             DataFrame with columns: label, feat_1..feat_N
         """
-        logger.info("Creating peptide + protein merged table...")
-        
-        rows = []
-        # Get unique peptide-protein pairs from mapping
-        pep_prot_pairs = self.mapping.mapping.drop_duplicates(
-            subset=['pep_seq', 'uniprot_id']
-        )
-        
-        for _, row in tqdm(pep_prot_pairs.iterrows(), total=len(pep_prot_pairs), 
-                          desc="Processing peptide-protein pairs"):
-            pep_seq = row['pep_seq']
-            prot_id = row['uniprot_id']
-
-            prot_idx = self.prot_idx_map.get(prot_id)
-
-            pep_indices = self.pep_lookup.get(
-                self.normalize_peptide_identifier(pep_seq), []
-            )
-
-            if not pep_indices or prot_idx is None:
-                continue
-
-            prot_emb = self.prot_emb[prot_idx]
-
-            for pep_idx in pep_indices:
-                pep_emb = self.pep_emb[pep_idx]
-
-                # Concatenate embeddings
-                merged_emb = EmbeddingAggregator.concatenate_embeddings([pep_emb, prot_emb])
-                if merged_emb is None:
-                    continue
-
-                rows.append({
-                    'label': f"{prot_id}_{self.normalize_peptide_identifier(pep_seq)}",
-                    'embedding': merged_emb
-                })
-        
-        # Convert to DataFrame
-        if not rows:
+        result = self._rows_to_dataframe(self.iter_pep_prot_rows())
+        if result.empty:
             logger.warning("No valid rows created for pep+prot table")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(rows)
-        
-        # Expand embedding columns
-        embedding_df = pd.DataFrame(
-            df['embedding'].tolist(),
-            index=df.index,
-            columns=[f'feat_{i + 1}' for i in range(df['embedding'].iloc[0].shape[0])]
-        )
-        
-        result = pd.concat([df[['label']], embedding_df], axis=1)
-        
-        logger.info(f"Created pep+prot table with {len(result)} rows and {result.shape[1]} columns")
+        else:
+            logger.info(f"Created pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
 
 
@@ -745,41 +690,87 @@ def load_embeddings_and_mapping(
     return cys_emb, pep_emb, prot_emb, list(cys_ids), list(pep_ids), list(prot_ids), mapping_df
 
 
-def save_merged_tables(
-    tables: Dict[str, pd.DataFrame],
+def save_merged_table(
+    table_name: str,
+    rows: Iterable[Tuple[str, np.ndarray]],
     output_dir: Path,
-    format: str = 'parquet'
-) -> None:
-    """
-    Save merged tables to disk.
-    
-    Args:
-        tables: Dictionary of table name -> DataFrame
-        output_dir: Output directory
-        format: Output format ('parquet', 'csv', 'both')
-    """
+    format: str = 'parquet',
+    chunk_size: int = 1024,
+) -> int:
+    """Save a streamed merged table to disk in bounded memory."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Saving merged tables to {output_dir}")
-    
-    for table_name, df in tables.items():
-        if df.empty:
-            logger.warning(f"Skipping empty table: {table_name}")
-            continue
-        
-        # Keep embeddings in expanded feature-column format (feat_1..feat_N).
-        df_to_save = df
-        
-        if format in ['parquet', 'both']:
-            output_path = output_dir / f"{table_name}.parquet"
-            logger.info(f"Saving {table_name} to {output_path}")
-            df_to_save.to_parquet(output_path, index=False, compression='snappy')
-        
+
+    row_iterator = iter(rows)
+    first_row = next(row_iterator, None)
+    if first_row is None:
+        logger.warning(f"Skipping empty table: {table_name}")
+        return 0
+
+    if format in ['parquet', 'both'] and (pa is None or pq is None):
+        raise ImportError(
+            "pyarrow is required for parquet output. Install it with `pip install pyarrow`."
+        )
+
+    _, first_embedding = first_row
+    feature_count = int(np.asarray(first_embedding).shape[0])
+    feature_columns = [f'feat_{i + 1}' for i in range(feature_count)]
+    csv_path = output_dir / f"{table_name}.csv"
+    parquet_path = output_dir / f"{table_name}.parquet"
+    csv_header_written = False
+    parquet_writer = None
+    buffered_labels: List[str] = []
+    buffered_embeddings: List[np.ndarray] = []
+    written_rows = 0
+
+    def flush_buffer() -> None:
+        nonlocal csv_header_written, parquet_writer
+        if not buffered_labels:
+            return
+
+        embedding_matrix = np.round(
+            np.vstack(buffered_embeddings).astype(np.float32, copy=False),
+            3,
+        )
+        chunk_df = pd.DataFrame(embedding_matrix, columns=feature_columns)
+        chunk_df.insert(0, 'index', buffered_labels)
+
         if format in ['csv', 'both']:
-            output_path = output_dir / f"{table_name}.csv"
-            logger.info(f"Saving {table_name} to {output_path}")
-            df_to_save.to_csv(output_path, index=False)
+            chunk_df.to_csv(
+                csv_path,
+                mode='a' if csv_header_written else 'w',
+                header=not csv_header_written,
+                index=False,
+            )
+            csv_header_written = True
+
+        if format in ['parquet', 'both']:
+            table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+            if parquet_writer is None:
+                parquet_writer = pq.ParquetWriter(parquet_path, table.schema, compression='snappy')
+            parquet_writer.write_table(table)
+
+        buffered_labels.clear()
+        buffered_embeddings.clear()
+
+    try:
+        for label, embedding in chain([first_row], row_iterator):
+            buffered_labels.append(str(label))
+            buffered_embeddings.append(np.asarray(embedding, dtype=np.float32))
+            written_rows += 1
+
+            if len(buffered_labels) >= chunk_size:
+                flush_buffer()
+
+        flush_buffer()
+    finally:
+        if parquet_writer is not None:
+            parquet_writer.close()
+
+    logger.info(
+        f"Saved {table_name} with {written_rows} rows and {feature_count + 1} columns to {output_dir}"
+    )
+    return written_rows
 
 
 # ============================================================================
@@ -875,23 +866,21 @@ def main():
             aggregation_method=args.aggregation_method
         )
         
-        # Create tables
-        tables = {}
-        
-        if 'cys_pep' in tables_to_create:
-            tables['cys_pep_merged'] = merger.create_cys_pep_table()
-        
-        if 'cys_pep_prot' in tables_to_create:
-            tables['cys_pep_prot_merged'] = merger.create_cys_pep_prot_table()
-        
-        if 'cys_prot' in tables_to_create:
-            tables['cys_prot_merged'] = merger.create_cys_prot_table()
-        
-        if 'pep_prot' in tables_to_create:
-            tables['pep_prot_merged'] = merger.create_pep_prot_table()
-        
-        # Save tables
-        save_merged_tables(tables, args.output_dir, format=args.output_format)
+        table_builders = {
+            'cys_pep': ('cys_pep_merged', merger.iter_cys_pep_rows),
+            'cys_pep_prot': ('cys_pep_prot_merged', merger.iter_cys_pep_prot_rows),
+            'cys_prot': ('cys_prot_merged', merger.iter_cys_prot_rows),
+            'pep_prot': ('pep_prot_merged', merger.iter_pep_prot_rows),
+        }
+
+        for table_key in tables_to_create:
+            table_name, row_builder = table_builders[table_key]
+            save_merged_table(
+                table_name,
+                row_builder(),
+                args.output_dir,
+                format=args.output_format,
+            )
         
         logger.info("✓ Successfully completed embedding merge!")
         
