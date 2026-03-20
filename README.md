@@ -769,7 +769,8 @@ python test_merge_embeddings.py --output-dir ./test_embeddings
   - `cys_prot`: Cysteine + protein merged table
   - `cys_pep_prot`: Cysteine + peptide + protein merged table
   - `pep_prot`: Peptide + protein merged table
-  - `all`: Create all four tables
+    - `pep_unique_residue`: Peptide-only table, one embedding per `uniprot_id_residue` (uses `--aggregation-method`)
+    - `all`: Create all five tables
 
 - `--log-level` (default: `INFO`):
   - `DEBUG`: Verbose debug output
@@ -808,6 +809,11 @@ Columns:
 - `pep_seq`: Peptide sequence
 - `protein_id`: Protein identifier
 - `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+
+### pep_unique_residue_merged
+Columns:
+- `uniprot_id_residue`: Unique residue identifier (stored in the `index` column in output files)
+- `embedding`: Peptide embedding only (shortest peptide or average of mapped peptides, based on `--aggregation-method`)
 
 ## SLURM Job Submission for Merge
 
