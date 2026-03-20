@@ -17,7 +17,7 @@ import torch
 import sys
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from Bio import SeqIO
 from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from fairscale.nn.wrap import enable_wrap, wrap
@@ -29,6 +29,11 @@ try:
 except ImportError:
     pa = None
     pq = None
+
+
+EMBEDDING_DECIMALS = 3
+PARQUET_COMPRESSION = 'zstd'
+PARQUET_COMPRESSION_LEVEL = 9
 
 
 # ============================================================================
@@ -359,12 +364,34 @@ def flush_parquet_records(
         )
 
     table = pa.Table.from_pylist(records)
+    table = optimize_parquet_table(table)
     if parquet_writer is None:
-        parquet_writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
+        parquet_writer = pq.ParquetWriter(
+            output_path,
+            table.schema,
+            compression=PARQUET_COMPRESSION,
+            compression_level=PARQUET_COMPRESSION_LEVEL,
+        )
 
     parquet_writer.write_table(table)
     records.clear()
     return parquet_writer
+
+
+def optimize_parquet_table(table: object) -> object:
+    """Cast Parquet columns to compact types before writing."""
+    if pa is None:
+        return table
+
+    optimized_fields = []
+    for field in table.schema:
+        if field.name.startswith('feat_'):
+            optimized_fields.append(pa.field(field.name, pa.float32()))
+        else:
+            optimized_fields.append(field)
+
+    optimized_schema = pa.schema(optimized_fields)
+    return table.cast(optimized_schema, safe=False)
 
 def process_batch(model, data_tuple, batch_converter, repr_layer_id: int) -> np.ndarray:
     """
@@ -594,7 +621,7 @@ def generate_embeddings(records: Iterable[Dict[str, object]],
 
 def embedding_to_feature_dict(embedding: np.ndarray, prefix: str = 'feat_') -> dict:
     """Convert embedding vector to expanded feature columns (feat_1, feat_2, ...)."""
-    rounded_embedding = np.round(embedding, 3)
+    rounded_embedding = np.round(embedding.astype(np.float32), EMBEDDING_DECIMALS)
     return {
         f'{prefix}{i + 1}': float(value)
         for i, value in enumerate(rounded_embedding)
