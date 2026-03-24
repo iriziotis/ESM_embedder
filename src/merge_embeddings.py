@@ -44,8 +44,29 @@ except ImportError:
     pa = None
     pq = None
 
+
+EMBEDDING_DECIMALS = 3
+PARQUET_COMPRESSION = 'zstd'
+PARQUET_COMPRESSION_LEVEL = 9
+
 # Suppress warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
+
+
+def optimize_parquet_table(table: object) -> object:
+    """Cast Parquet feature columns to compact types before writing."""
+    if pa is None:
+        return table
+
+    optimized_fields = []
+    for field in table.schema:
+        if field.name.startswith('feat_'):
+            optimized_fields.append(pa.field(field.name, pa.float32()))
+        else:
+            optimized_fields.append(field)
+
+    optimized_schema = pa.schema(optimized_fields)
+    return table.cast(optimized_schema, safe=False)
 
 # ============================================================================
 # Setup Logging
@@ -775,7 +796,7 @@ def save_merged_table(
 
         embedding_matrix = np.round(
             np.vstack(buffered_embeddings).astype(np.float32, copy=False),
-            3,
+            EMBEDDING_DECIMALS,
         )
         chunk_df = pd.DataFrame(embedding_matrix, columns=feature_columns)
         chunk_df.insert(0, 'index', buffered_labels)
@@ -791,8 +812,14 @@ def save_merged_table(
 
         if format in ['parquet', 'both']:
             table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+            table = optimize_parquet_table(table)
             if parquet_writer is None:
-                parquet_writer = pq.ParquetWriter(parquet_path, table.schema, compression='snappy')
+                parquet_writer = pq.ParquetWriter(
+                    parquet_path,
+                    table.schema,
+                    compression=PARQUET_COMPRESSION,
+                    compression_level=PARQUET_COMPRESSION_LEVEL,
+                )
             parquet_writer.write_table(table)
 
         buffered_labels.clear()
