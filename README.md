@@ -653,13 +653,14 @@ A Python script for efficiently merging ESM-2 embeddings from cysteines, peptide
 - **Flexible aggregation strategies**: 
   - `shortest`: Use the shortest peptide containing each cysteine
   - `average`: Average embeddings across all peptides containing each cysteine
-- **Six merge types**:
+- **Seven merge types**:
   1. `cys_pep` — Cysteine + Peptide (aggregated, one row per cysteine)
   2. `cys_prot` — Cysteine + Protein (one row per cysteine)
   3. `cys_pep_prot` — Cysteine + Peptide + Protein (one row per cysteine × peptide combination)
   4. `cys_pep_prot_agg` — Cysteine + Peptide + Protein (aggregated, one row per cysteine)
-  5. `pep_prot` — Peptide + Protein
-  6. `pep_agg` — Peptide-only, one aggregated row per cysteine
+  5. `pep_prot` — Peptide + Protein (one row per peptide × protein pair)
+  6. `pep_prot_agg` — Peptide + Protein (aggregated, one row per cysteine)
+  7. `pep_agg` — Peptide-only, one aggregated row per cysteine
 - **Memory-efficient processing**: Handles large datasets without loading entire matrices into memory
 - **Parallel processing ready**: Architected for scalable processing
 - **Comprehensive logging**: Detailed progress tracking and error reporting
@@ -800,6 +801,9 @@ The script generates parquet/CSV files with concatenated embeddings. All tables 
 ### pep_prot_merged
 `index` format: `{uniprot_id}_{pep_seq}` — one row per peptide × protein pair.
 
+### pep_prot_agg_merged
+`index` format: `{uniprot_id}_{residue}` — one row per cysteine; peptide embedding collapsed via `--aggregation-method`, concatenated with the protein embedding.
+
 ### pep_agg_merged
 `index` format: `{uniprot_id}_{residue}` — peptide embedding only (shortest peptide or average across mapped peptides, based on `--aggregation-method`), one row per cysteine.
 
@@ -874,6 +878,7 @@ python src/merge_embeddings.py \
 # - results/merged_embeddings/cys_pep_prot_merged.parquet
 # - results/merged_embeddings/cys_pep_prot_agg_merged.parquet
 # - results/merged_embeddings/pep_prot_merged.parquet
+# - results/merged_embeddings/pep_prot_agg_merged.parquet
 # - results/merged_embeddings/pep_agg_merged.parquet
 ```
 
