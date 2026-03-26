@@ -653,11 +653,13 @@ A Python script for efficiently merging ESM-2 embeddings from cysteines, peptide
 - **Flexible aggregation strategies**: 
   - `shortest`: Use the shortest peptide containing each cysteine
   - `average`: Average embeddings across all peptides containing each cysteine
-- **Four merge types**:
-  1. Cysteine + Peptide embeddings
-  2. Cysteine + Protein embeddings
-  3. Cysteine + Peptide + Protein embeddings  
-  4. Peptide + Protein embeddings
+- **Six merge types**:
+  1. `cys_pep` — Cysteine + Peptide (aggregated, one row per cysteine)
+  2. `cys_prot` — Cysteine + Protein (one row per cysteine)
+  3. `cys_pep_prot` — Cysteine + Peptide + Protein (one row per cysteine × peptide combination)
+  4. `cys_pep_prot_agg` — Cysteine + Peptide + Protein (aggregated, one row per cysteine)
+  5. `pep_prot` — Peptide + Protein
+  6. `pep_agg` — Peptide-only, one aggregated row per cysteine
 - **Memory-efficient processing**: Handles large datasets without loading entire matrices into memory
 - **Parallel processing ready**: Architected for scalable processing
 - **Comprehensive logging**: Detailed progress tracking and error reporting
@@ -765,12 +767,13 @@ python test_merge_embeddings.py --output-dir ./test_embeddings
   - `both`: Save in both formats
 
 - `--tables` (default: `all`):
-  - `cys_pep`: Cysteine + peptide merged table
-  - `cys_prot`: Cysteine + protein merged table
-  - `cys_pep_prot`: Cysteine + peptide + protein merged table
-  - `pep_prot`: Peptide + protein merged table
-    - `pep_unique_residue`: Peptide-only table, one embedding per `uniprot_id_residue` (uses `--aggregation-method`)
-    - `all`: Create all five tables
+  - `cys_pep`: Cysteine + peptide (aggregated), one row per cysteine
+  - `cys_prot`: Cysteine + protein, one row per cysteine
+  - `cys_pep_prot`: Cysteine + peptide + protein, one row per cysteine × peptide combination
+  - `cys_pep_prot_agg`: Cysteine + peptide + protein (aggregated), one row per cysteine
+  - `pep_prot`: Peptide + protein
+  - `pep_agg`: Peptide-only, one aggregated row per cysteine (uses `--aggregation-method`)
+  - `all`: Create all six tables
 
 - `--log-level` (default: `INFO`):
   - `DEBUG`: Verbose debug output
@@ -780,40 +783,25 @@ python test_merge_embeddings.py --output-dir ./test_embeddings
 
 ## Merge Tool Output
 
-The script generates parquet/CSV files with concatenated embeddings:
+The script generates parquet/CSV files with concatenated embeddings. All tables have an `index` column containing the row identifier, followed by `feat_1 … feat_N` feature columns.
 
 ### cys_pep_merged
-Columns:
-- `uniprot_id`: Protein identifier
-- `residue`: Cysteine residue identifier
-- `pep_seq`: Peptide sequence (shortest for aggregation_method=shortest)
-- `aggregation_method`: Method used for peptide aggregation
-- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+`index` format: `{uniprot_id}_{residue}_{pep_seq}` — one row per cysteine (peptide selected/averaged via `--aggregation-method`).
 
 ### cys_prot_merged
-Columns:
-- `uniprot_id`: Protein identifier
-- `residue`: Cysteine residue identifier
-- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+`index` format: `{uniprot_id}_{residue}` — one row per cysteine.
 
 ### cys_pep_prot_merged
-Columns:
-- `uniprot_id`: Protein identifier
-- `residue`: Cysteine residue identifier
-- `pep_seq`: Peptide sequence
-- `protein_id`: Protein identifier (from mapping)
-- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+`index` format: `{uniprot_id}_{residue}_{pep_seq}` — one row per cysteine × peptide combination.
+
+### cys_pep_prot_agg_merged
+`index` format: `{uniprot_id}_{residue}` — one row per cysteine; peptide embedding collapsed via `--aggregation-method`.
 
 ### pep_prot_merged
-Columns:
-- `pep_seq`: Peptide sequence
-- `protein_id`: Protein identifier
-- `embedding`: String representation of concatenated embeddings (e.g., "[1.234, 5.678, ...]")
+`index` format: `{uniprot_id}_{pep_seq}` — one row per peptide × protein pair.
 
-### pep_unique_residue_merged
-Columns:
-- `uniprot_id_residue`: Unique residue identifier (stored in the `index` column in output files)
-- `embedding`: Peptide embedding only (shortest peptide or average of mapped peptides, based on `--aggregation-method`)
+### pep_agg_merged
+`index` format: `{uniprot_id}_{residue}` — peptide embedding only (shortest peptide or average across mapped peptides, based on `--aggregation-method`), one row per cysteine.
 
 ## SLURM Job Submission for Merge
 
@@ -884,7 +872,9 @@ python src/merge_embeddings.py \
 # - results/merged_embeddings/cys_pep_merged.parquet
 # - results/merged_embeddings/cys_prot_merged.parquet
 # - results/merged_embeddings/cys_pep_prot_merged.parquet
+# - results/merged_embeddings/cys_pep_prot_agg_merged.parquet
 # - results/merged_embeddings/pep_prot_merged.parquet
+# - results/merged_embeddings/pep_agg_merged.parquet
 ```
 
 ### Example 2: Using Parquet Files
@@ -909,7 +899,7 @@ python src/merge_embeddings.py \
     --protein-embeddings data/embeddings/proteins.npy \
     --mapping data/metadata/mapping.csv \
     --output-dir results/merged \
-    --tables cys_pep cys_prot cys_pep_prot
+    --tables cys_pep cys_prot cys_pep_prot cys_pep_prot_agg
 ```
 
 ### Example 4: Use Results in ML Pipeline

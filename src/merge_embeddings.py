@@ -8,8 +8,9 @@ Supports batch processing and parallelization for large datasets.
 
 Features:
 - Efficient loading of embeddings (supports .npy, .npz, parquet, CSV)
-- Five types of merged tables: cys+pep, cys+pep+protein, cys+protein, pep+protein,
-  and peptide-only per unique residue
+- Six types of merged tables: cys+pep, cys+pep+protein (all combos), cys+pep+protein
+  (aggregated, one row per cysteine), cys+protein, pep+protein, and peptide-only per
+  unique residue
 - Flexible aggregation strategies (shortest peptide or average embeddings)
 - Parallel processing with configurable worker count
 - Handles large files using chunking and memory-efficient I/O
@@ -561,6 +562,50 @@ class MergeTablesCreator:
                         merged_emb,
                     )
 
+    def iter_cys_pep_prot_agg_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield cysteine + peptide (aggregated) + protein merged rows, one per cysteine.
+
+        Uses aggregation_method to collapse multiple peptides to a single embedding
+        per cysteine, producing exactly one row per cysteine (same cardinality as
+        iter_cys_pep_rows but with the protein embedding appended).
+        """
+        logger.info("Creating cysteine + peptide (aggregated) + protein merged table...")
+
+        for cys_id in tqdm(self.cys_ids, desc="Processing cysteines"):
+            cys_idx = self.cys_idx_map.get(cys_id)
+            if cys_idx is None:
+                continue
+
+            # Protein is uniquely encoded in cys_id (uniprot_id_residue)
+            proteins = self.mapping.get_proteins_for_cysteine(cys_id)
+            if not proteins:
+                continue
+            prot_idx = self.prot_idx_map.get(proteins[0])
+            if prot_idx is None:
+                continue
+
+            if self.aggregation_method == 'shortest':
+                shortest_peptide = self.mapping.get_shortest_peptide(cys_id)
+                if shortest_peptide is None:
+                    continue
+                peptide_ids = [shortest_peptide]
+            else:
+                peptide_ids = self.mapping.get_peptides_for_cysteine(cys_id)
+                if not peptide_ids:
+                    continue
+
+            pep_emb = self._collect_peptide_embeddings(peptide_ids)
+            if pep_emb is None:
+                continue
+
+            merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                [self.cys_emb[cys_idx], pep_emb, self.prot_emb[prot_idx]]
+            )
+            if merged_emb is None:
+                continue
+
+            yield f"{proteins[0]}_{self._extract_residue_from_cys_id(cys_id)}", merged_emb
+
     def iter_cys_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield cysteine + protein merged rows one at a time."""
         logger.info("Creating cysteine + protein merged table...")
@@ -607,9 +652,9 @@ class MergeTablesCreator:
 
                 yield f"{prot_id}_{self.normalize_peptide_identifier(pep_seq)}", merged_emb
 
-    def iter_pep_unique_residue_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+    def iter_pep_agg_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield peptide-only embeddings aggregated to one row per unique cysteine id."""
-        logger.info("Creating peptide-only unique-residue table...")
+        logger.info("Creating peptide (aggregated) table...")
 
         seen_cys_ids = set()
         for cys_id in tqdm(self.cys_ids, desc="Processing unique residues"):
@@ -662,6 +707,25 @@ class MergeTablesCreator:
             logger.info(f"Created cys+pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
     
+    def create_cys_pep_prot_agg_table(self) -> pd.DataFrame:
+        """
+        Create table of cysteine + peptide (aggregated) + protein embeddings.
+
+        One row per cysteine; peptides are collapsed using aggregation_method.
+
+        Returns:
+            DataFrame with columns: index, feat_1..feat_N
+        """
+        result = self._rows_to_dataframe(self.iter_cys_pep_prot_agg_rows())
+        if result.empty:
+            logger.warning("No valid rows created for cys+pep+prot (aggregated) table")
+        else:
+            logger.info(
+                f"Created cys+pep+prot (aggregated) table with {len(result)} rows "
+                f"and {result.shape[1]} columns"
+            )
+        return result
+
     def create_cys_prot_table(self) -> pd.DataFrame:
         """
         Create table of cysteine + protein embeddings.
@@ -690,19 +754,19 @@ class MergeTablesCreator:
             logger.info(f"Created pep+prot table with {len(result)} rows and {result.shape[1]} columns")
         return result
 
-    def create_pep_unique_residue_table(self) -> pd.DataFrame:
+    def create_pep_agg_table(self) -> pd.DataFrame:
         """
         Create table of peptide-only embeddings per unique residue id.
 
         Returns:
-            DataFrame with columns: label (uniprot_id_residue), feat_1..feat_N
+            DataFrame with columns: index (uniprot_id_residue), feat_1..feat_N
         """
-        result = self._rows_to_dataframe(self.iter_pep_unique_residue_rows())
+        result = self._rows_to_dataframe(self.iter_pep_agg_rows())
         if result.empty:
-            logger.warning("No valid rows created for peptide unique-residue table")
+            logger.warning("No valid rows created for peptide (aggregated) table")
         else:
             logger.info(
-                "Created peptide unique-residue table with "
+                "Created peptide (aggregated) table with "
                 f"{len(result)} rows and {result.shape[1]} columns"
             )
         return result
@@ -896,7 +960,7 @@ def main():
     parser.add_argument(
         '--tables',
         nargs='+',
-        choices=['cys_pep', 'cys_pep_prot', 'cys_prot', 'pep_prot', 'pep_unique_residue', 'all'],
+        choices=['cys_pep', 'cys_pep_prot', 'cys_pep_prot_agg', 'cys_prot', 'pep_prot', 'pep_agg', 'all'],
         default=['all'],
         help='Which tables to create'
     )
@@ -920,9 +984,10 @@ def main():
             tables_to_create = [
                 'cys_pep',
                 'cys_pep_prot',
+                'cys_pep_prot_agg',
                 'cys_prot',
                 'pep_prot',
-                'pep_unique_residue',
+                'pep_agg',
             ]
         
         # Load embeddings and mapping
@@ -947,11 +1012,12 @@ def main():
         table_builders = {
             'cys_pep': ('cys_pep_merged', merger.iter_cys_pep_rows),
             'cys_pep_prot': ('cys_pep_prot_merged', merger.iter_cys_pep_prot_rows),
+            'cys_pep_prot_agg': ('cys_pep_prot_agg_merged', merger.iter_cys_pep_prot_agg_rows),
             'cys_prot': ('cys_prot_merged', merger.iter_cys_prot_rows),
             'pep_prot': ('pep_prot_merged', merger.iter_pep_prot_rows),
-            'pep_unique_residue': (
-                'pep_unique_residue_merged',
-                merger.iter_pep_unique_residue_rows,
+            'pep_agg': (
+                'pep_agg_merged',
+                merger.iter_pep_agg_rows,
             ),
         }
 
