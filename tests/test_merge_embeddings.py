@@ -140,10 +140,11 @@ def create_test_mapping(
 def run_merge_test(
     script_path: Path,
     data_dir: Path,
-    output_dir: Path
+    output_dir: Path,
+    merge_strategy: str,
 ) -> bool:
     """Run the merge_embeddings script on test data."""
-    logger.info("\nRunning merge_embeddings on test data...")
+    logger.info(f"\nRunning merge_embeddings on test data (merge_strategy={merge_strategy})...")
     
     cmd = [
         'python3',
@@ -154,6 +155,7 @@ def run_merge_test(
         '--mapping', str(data_dir / 'mapping.csv'),
         '--output-dir', str(output_dir),
         '--aggregation-method', 'shortest',
+        '--merge-strategy', merge_strategy,
         '--output-format', 'csv',
         '--tables', 'all',
         '--log-level', 'INFO'
@@ -178,15 +180,19 @@ def run_merge_test(
         logger.error(f"✗ Error running script: {e}")
         return False
 
-def validate_output(output_dir: Path) -> bool:
+def validate_output(output_dir: Path, merge_strategy: str) -> bool:
     """Validate output files."""
-    logger.info("\nValidating output files...")
+    logger.info(f"\nValidating output files (merge_strategy={merge_strategy})...")
     
     expected_files = [
-        'cys_pep_merged.csv',
-        'cys_pep_prot_merged.csv',
-        'cys_prot_merged.csv',
-        'pep_prot_merged.csv'
+        f'cys_level-cys_only-{merge_strategy}.csv',
+        f'cys_level-cys_pep-{merge_strategy}.csv',
+        f'cys_level-cys_pep_prot_agg-{merge_strategy}.csv',
+        f'cys_level-cys_prot-{merge_strategy}.csv',
+        f'cys_level-pep_agg-{merge_strategy}.csv',
+        f'cys_level-pep_prot_agg-{merge_strategy}.csv',
+        f'peptide_level-cys_pep_prot-{merge_strategy}.csv',
+        f'peptide_level-pep_prot-{merge_strategy}.csv'
     ]
     
     all_exist = True
@@ -275,15 +281,15 @@ def main():
         cys_df['label'] = cys_df['label'].map(cys_label_map)
         cys_df.to_csv(cys_emb_path, index=False)
         
-        # Step 2: Run merge
-        if not run_merge_test(script_path, data_dir, output_dir):
-            logger.error("\n✗ Test failed at merge step")
-            sys.exit(1)
-        
-        # Step 3: Validate output
-        if not validate_output(output_dir):
-            logger.error("\n✗ Test failed at validation step")
-            sys.exit(1)
+        # Step 2 + 3: Run merge and validate for both merge strategies.
+        for merge_strategy in ['concat', 'average']:
+            if not run_merge_test(script_path, data_dir, output_dir, merge_strategy):
+                logger.error(f"\n✗ Test failed at merge step (merge_strategy={merge_strategy})")
+                sys.exit(1)
+
+            if not validate_output(output_dir, merge_strategy):
+                logger.error(f"\n✗ Test failed at validation step (merge_strategy={merge_strategy})")
+                sys.exit(1)
         
         logger.info("\n" + "=" * 60)
         logger.info("✓ All tests passed!")
