@@ -56,8 +56,9 @@ MAPPING_FILE="${DATA_DIR}/mapping.csv"
 
 # Script parameters
 AGGREGATION_METHOD="shortest"  # 'shortest' or 'average'
+MERGE_STRATEGY="concat"        # 'concat' or 'average'
 OUTPUT_FORMAT="parquet"         # 'parquet', 'csv', or 'both'
-TABLES="all"                    # 'cys_pep', 'cys_pep_prot', 'pep_prot', or 'all'
+TABLES="all"                    # e.g. 'cys_only cys_pep cys_prot' or 'all'
 LOG_LEVEL="INFO"                # 'DEBUG', 'INFO', 'WARNING', 'ERROR'
 
 # ============================================================================
@@ -83,6 +84,7 @@ echo "  SCRIPT_DIR: $SCRIPT_DIR"
 echo "  DATA_DIR: $DATA_DIR"
 echo "  OUTPUT_DIR: $OUTPUT_DIR"
 echo "  Aggregation Method: $AGGREGATION_METHOD"
+echo "  Merge Strategy: $MERGE_STRATEGY"
 echo "  Output Format: $OUTPUT_FORMAT"
 echo "  Tables: $TABLES"
 echo ""
@@ -113,6 +115,7 @@ python3 "${SCRIPT_DIR}/merge_embeddings.py" \
     --mapping "$MAPPING_FILE" \
     --output-dir "$OUTPUT_DIR" \
     --aggregation-method "$AGGREGATION_METHOD" \
+    --merge-strategy "$MERGE_STRATEGY" \
     --output-format "$OUTPUT_FORMAT" \
     --tables $TABLES \
     --log-level "$LOG_LEVEL"

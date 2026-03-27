@@ -653,14 +653,18 @@ A Python script for efficiently merging ESM-2 embeddings from cysteines, peptide
 - **Flexible aggregation strategies**: 
   - `shortest`: Use the shortest peptide containing each cysteine
   - `average`: Average embeddings across all peptides containing each cysteine
-- **Seven merge types**:
-  1. `cys_pep` — Cysteine + Peptide (aggregated, one row per cysteine)
-  2. `cys_prot` — Cysteine + Protein (one row per cysteine)
-  3. `cys_pep_prot` — Cysteine + Peptide + Protein (one row per cysteine × peptide combination)
-  4. `cys_pep_prot_agg` — Cysteine + Peptide + Protein (aggregated, one row per cysteine)
-  5. `pep_prot` — Peptide + Protein (one row per peptide × protein pair)
-  6. `pep_prot_agg` — Peptide + Protein (aggregated, one row per cysteine)
-  7. `pep_agg` — Peptide-only, one aggregated row per cysteine
+- **Flexible merge strategies**:
+    - `concat`: Concatenate level embeddings (default)
+    - `average`: Average level embeddings (requires same embedding dimension per level)
+- **Eight merge types**:
+    1. `cys_only` — Cysteine-only embeddings (one row per cysteine)
+    2. `cys_pep` — Cysteine + peptide (aggregated, one row per cysteine)
+    3. `cys_prot` — Cysteine + protein (one row per cysteine)
+    4. `cys_pep_prot_agg` — Cysteine + peptide + protein (aggregated, one row per cysteine)
+    5. `pep_prot_agg` — Peptide + protein (aggregated, one row per cysteine)
+    6. `pep_agg` — Peptide-only, one aggregated row per cysteine
+    7. `cys_pep_prot` — Peptide-level cysteine + peptide + protein (row per cysteine × peptide)
+    8. `pep_prot` — Peptide-level peptide + protein (row per peptide × protein)
 - **Memory-efficient processing**: Handles large datasets without loading entire matrices into memory
 - **Parallel processing ready**: Architected for scalable processing
 - **Comprehensive logging**: Detailed progress tracking and error reporting
@@ -725,6 +729,7 @@ python src/merge_embeddings.py \
     --mapping data/mapping.csv \
     --output-dir results/merged \
     --aggregation-method average \
+    --merge-strategy concat \
     --output-format both \
     --tables cys_pep cys_pep_prot \
     --log-level DEBUG
@@ -767,14 +772,20 @@ python test_merge_embeddings.py --output-dir ./test_embeddings
   - `csv`: Save as CSV files (larger file sizes)
   - `both`: Save in both formats
 
+- `--merge-strategy` (default: `concat`):
+    - `concat`: Concatenate cysteine/peptide/protein vectors
+    - `average`: Average cysteine/peptide/protein vectors
+
 - `--tables` (default: `all`):
-  - `cys_pep`: Cysteine + peptide (aggregated), one row per cysteine
+    - `cys_only`: Cysteine-only embeddings, one row per cysteine
+    - `cys_pep`: Cysteine + peptide (aggregated), one row per cysteine
   - `cys_prot`: Cysteine + protein, one row per cysteine
   - `cys_pep_prot`: Cysteine + peptide + protein, one row per cysteine × peptide combination
   - `cys_pep_prot_agg`: Cysteine + peptide + protein (aggregated), one row per cysteine
   - `pep_prot`: Peptide + protein
+    - `pep_prot_agg`: Peptide + protein (aggregated), one row per cysteine
   - `pep_agg`: Peptide-only, one aggregated row per cysteine (uses `--aggregation-method`)
-  - `all`: Create all six tables
+    - `all`: Create all eight tables
 
 - `--log-level` (default: `INFO`):
   - `DEBUG`: Verbose debug output
@@ -784,28 +795,35 @@ python test_merge_embeddings.py --output-dir ./test_embeddings
 
 ## Merge Tool Output
 
-The script generates parquet/CSV files with concatenated embeddings. All tables have an `index` column containing the row identifier, followed by `feat_1 … feat_N` feature columns.
+The script generates parquet/CSV files with either concatenated or averaged level embeddings (controlled by `--merge-strategy`). All tables have an `index` column followed by `feat_1 … feat_N` feature columns.
 
-### cys_pep_merged
-`index` format: `{uniprot_id}_{residue}_{pep_seq}` — one row per cysteine (peptide selected/averaged via `--aggregation-method`).
+Output naming convention:
+- `cys_level-<table_key>-<merge_strategy>.*` for cysteine-level outputs (`index = uniprot_id_residue`)
+- `peptide_level-<table_key>-<merge_strategy>.*` for peptide-level outputs (`index` includes peptide sequence)
 
-### cys_prot_merged
+### cys_level-cys_only-<merge_strategy>
+`index` format: `{uniprot_id}_{residue}`.
+
+### cys_level-cys_pep-<merge_strategy>
+`index` format: `{uniprot_id}_{residue}` — one row per cysteine (peptide selected/averaged via `--aggregation-method`).
+
+### cys_level-cys_prot-<merge_strategy>
 `index` format: `{uniprot_id}_{residue}` — one row per cysteine.
 
-### cys_pep_prot_merged
-`index` format: `{uniprot_id}_{residue}_{pep_seq}` — one row per cysteine × peptide combination.
-
-### cys_pep_prot_agg_merged
+### cys_level-cys_pep_prot_agg-<merge_strategy>
 `index` format: `{uniprot_id}_{residue}` — one row per cysteine; peptide embedding collapsed via `--aggregation-method`.
 
-### pep_prot_merged
-`index` format: `{uniprot_id}_{pep_seq}` — one row per peptide × protein pair.
+### cys_level-pep_prot_agg-<merge_strategy>
+`index` format: `{uniprot_id}_{residue}` — one row per cysteine; peptide embedding collapsed via `--aggregation-method`.
 
-### pep_prot_agg_merged
-`index` format: `{uniprot_id}_{residue}` — one row per cysteine; peptide embedding collapsed via `--aggregation-method`, concatenated with the protein embedding.
-
-### pep_agg_merged
+### cys_level-pep_agg-<merge_strategy>
 `index` format: `{uniprot_id}_{residue}` — peptide embedding only (shortest peptide or average across mapped peptides, based on `--aggregation-method`), one row per cysteine.
+
+### peptide_level-cys_pep_prot-<merge_strategy>
+`index` format: `{uniprot_id}_{residue}_{pep_seq}` — one row per cysteine × peptide combination.
+
+### peptide_level-pep_prot-<merge_strategy>
+`index` format: `{uniprot_id}_{pep_seq}` — one row per peptide × protein pair.
 
 ## SLURM Job Submission for Merge
 
@@ -851,6 +869,7 @@ MAPPING_FILE="${DATA_DIR}/mapping.csv"
 
 # Script parameters
 AGGREGATION_METHOD="shortest"
+MERGE_STRATEGY="concat"
 OUTPUT_FORMAT="parquet"
 TABLES="all"
 ```
@@ -870,16 +889,18 @@ python src/merge_embeddings.py \
     --protein-embeddings data/embeddings/proteins.npy \
     --mapping data/metadata/mapping.csv \
     --output-dir results/merged_embeddings \
-    --aggregation-method shortest
+    --aggregation-method shortest \
+    --merge-strategy concat
 
 # Output files:
-# - results/merged_embeddings/cys_pep_merged.parquet
-# - results/merged_embeddings/cys_prot_merged.parquet
-# - results/merged_embeddings/cys_pep_prot_merged.parquet
-# - results/merged_embeddings/cys_pep_prot_agg_merged.parquet
-# - results/merged_embeddings/pep_prot_merged.parquet
-# - results/merged_embeddings/pep_prot_agg_merged.parquet
-# - results/merged_embeddings/pep_agg_merged.parquet
+# - results/merged_embeddings/cys_level-cys_only-concat.parquet
+# - results/merged_embeddings/cys_level-cys_pep-concat.parquet
+# - results/merged_embeddings/cys_level-cys_prot-concat.parquet
+# - results/merged_embeddings/cys_level-cys_pep_prot_agg-concat.parquet
+# - results/merged_embeddings/cys_level-pep_prot_agg-concat.parquet
+# - results/merged_embeddings/cys_level-pep_agg-concat.parquet
+# - results/merged_embeddings/peptide_level-cys_pep_prot-concat.parquet
+# - results/merged_embeddings/peptide_level-pep_prot-concat.parquet
 ```
 
 ### Example 2: Using Parquet Files
@@ -904,7 +925,7 @@ python src/merge_embeddings.py \
     --protein-embeddings data/embeddings/proteins.npy \
     --mapping data/metadata/mapping.csv \
     --output-dir results/merged \
-    --tables cys_pep cys_prot cys_pep_prot cys_pep_prot_agg
+    --tables cys_only cys_pep cys_prot cys_pep_prot_agg pep_prot_agg pep_agg
 ```
 
 ### Example 4: Use Results in ML Pipeline
@@ -916,7 +937,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
 # Load merged embeddings
-df = pd.read_parquet('results/merged_embeddings/cys_pep_merged.parquet')
+df = pd.read_parquet('results/merged_embeddings/cys_level-cys_pep-concat.parquet')
 
 # Parse embedding strings to arrays
 import ast

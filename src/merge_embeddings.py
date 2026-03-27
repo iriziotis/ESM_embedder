@@ -8,10 +8,11 @@ Supports batch processing and parallelization for large datasets.
 
 Features:
 - Efficient loading of embeddings (supports .npy, .npz, parquet, CSV)
-- Seven types of merged tables: cys+pep, cys+pep+protein (all combos), cys+pep+protein
+- Eight types of merged tables: cys-only, cys+pep, cys+pep+protein (all combos), cys+pep+protein
   (aggregated), cys+protein, pep+protein (all combos), pep+protein (aggregated), and
   peptide-only (aggregated, one row per cysteine)
 - Flexible aggregation strategies (shortest peptide or average embeddings)
+- Flexible merge strategies for combining component embeddings (concatenation or averaging)
 - Parallel processing with configurable worker count
 - Handles large files using chunking and memory-efficient I/O
 
@@ -399,7 +400,8 @@ class MergeTablesCreator:
         pep_ids: List[str],
         protein_ids: List[str],
         mapping: MappingHandler,
-        aggregation_method: str = 'shortest'
+        aggregation_method: str = 'shortest',
+        merge_strategy: str = 'concat',
     ):
         """
         Initialize merger.
@@ -413,6 +415,7 @@ class MergeTablesCreator:
             protein_ids: List of protein identifiers
             mapping: MappingHandler instance
             aggregation_method: 'shortest' or 'average' for peptide aggregation
+            merge_strategy: 'concat' or 'average' for merging components across levels
         """
         self.cys_emb = cys_embeddings
         self.pep_emb = pep_embeddings
@@ -438,12 +441,14 @@ class MergeTablesCreator:
         
         self.mapping = mapping
         self.aggregation_method = aggregation_method
+        self.merge_strategy = merge_strategy
         
         logger.info(f"Initialized MergeTablesCreator with:")
         logger.info(f"  Cysteine embeddings: {self.cys_emb.shape}")
         logger.info(f"  Peptide embeddings: {self.pep_emb.shape}")
         logger.info(f"  Protein embeddings: {self.prot_emb.shape}")
         logger.info(f"  Aggregation method: {self.aggregation_method}")
+        logger.info(f"  Merge strategy: {self.merge_strategy}")
 
     @staticmethod
     def normalize_peptide_identifier(peptide_id: str) -> str:
@@ -501,6 +506,40 @@ class MergeTablesCreator:
             np.asarray(peptide_embeddings, dtype=np.float32)
         )
 
+    def _merge_components(self, embeddings: List[np.ndarray]) -> Optional[np.ndarray]:
+        """Merge component embeddings according to merge_strategy."""
+        if self.merge_strategy == 'concat':
+            return EmbeddingAggregator.concatenate_embeddings(embeddings)
+
+        # Average strategy requires same-dimensional vectors across components.
+        vectors = [np.asarray(embedding, dtype=np.float32) for embedding in embeddings]
+        if not vectors:
+            return None
+
+        first_shape = vectors[0].shape
+        if any(vector.shape != first_shape for vector in vectors):
+            raise ValueError(
+                "merge_strategy='average' requires all component embeddings to have the same shape"
+            )
+
+        return EmbeddingAggregator.average_embeddings(np.stack(vectors, axis=0))
+
+    def iter_cys_only_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield cysteine-only rows one per unique cysteine identifier."""
+        logger.info("Creating cysteine-only table...")
+
+        seen_cys_ids: set = set()
+        for cys_id in tqdm(self.cys_ids, desc="Processing cysteine embeddings"):
+            if cys_id in seen_cys_ids:
+                continue
+            seen_cys_ids.add(cys_id)
+
+            cys_idx = self.cys_idx_map.get(cys_id)
+            if cys_idx is None:
+                continue
+
+            yield str(cys_id), self.cys_emb[cys_idx]
+
     def iter_cys_pep_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield cysteine + peptide merged rows one at a time."""
         logger.info("Creating cysteine + peptide merged table...")
@@ -524,12 +563,12 @@ class MergeTablesCreator:
             if pep_emb is None:
                 continue
 
-            merged_emb = EmbeddingAggregator.concatenate_embeddings([self.cys_emb[cys_idx], pep_emb])
+            merged_emb = self._merge_components([self.cys_emb[cys_idx], pep_emb])
             if merged_emb is None:
                 continue
 
-            first_peptide = self.normalize_peptide_identifier(peptide_ids[0])
-            yield f"{cys_id}_{first_peptide}", merged_emb
+            # Cysteine-level outputs always use uniprot_id_residue index.
+            yield str(cys_id), merged_emb
 
     def iter_cys_pep_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield cysteine + peptide + protein merged rows one at a time."""
@@ -550,7 +589,7 @@ class MergeTablesCreator:
 
                 prot_emb = self.prot_emb[prot_idx]
                 for pep_idx in pep_indices:
-                    merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                    merged_emb = self._merge_components(
                         [cys_emb, self.pep_emb[pep_idx], prot_emb]
                     )
                     if merged_emb is None:
@@ -598,13 +637,13 @@ class MergeTablesCreator:
             if pep_emb is None:
                 continue
 
-            merged_emb = EmbeddingAggregator.concatenate_embeddings(
+            merged_emb = self._merge_components(
                 [self.cys_emb[cys_idx], pep_emb, self.prot_emb[prot_idx]]
             )
             if merged_emb is None:
                 continue
 
-            yield f"{proteins[0]}_{self._extract_residue_from_cys_id(cys_id)}", merged_emb
+            yield str(cys_id), merged_emb
 
     def iter_cys_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield cysteine + protein merged rows one at a time."""
@@ -620,13 +659,13 @@ class MergeTablesCreator:
             if cys_idx is None or prot_idx is None:
                 continue
 
-            merged_emb = EmbeddingAggregator.concatenate_embeddings(
+            merged_emb = self._merge_components(
                 [self.cys_emb[cys_idx], self.prot_emb[prot_idx]]
             )
             if merged_emb is None:
                 continue
 
-            yield f"{prot_id}_{self._extract_residue_from_cys_id(cys_id)}", merged_emb
+            yield str(cys_id), merged_emb
 
     def iter_pep_prot_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield peptide + protein merged rows one at a time."""
@@ -644,7 +683,7 @@ class MergeTablesCreator:
 
             prot_emb = self.prot_emb[prot_idx]
             for pep_idx in pep_indices:
-                merged_emb = EmbeddingAggregator.concatenate_embeddings(
+                merged_emb = self._merge_components(
                     [self.pep_emb[pep_idx], prot_emb]
                 )
                 if merged_emb is None:
@@ -687,13 +726,13 @@ class MergeTablesCreator:
             if pep_emb is None:
                 continue
 
-            merged_emb = EmbeddingAggregator.concatenate_embeddings(
+            merged_emb = self._merge_components(
                 [pep_emb, self.prot_emb[prot_idx]]
             )
             if merged_emb is None:
                 continue
 
-            yield f"{proteins[0]}_{self._extract_residue_from_cys_id(cys_id)}", merged_emb
+            yield str(cys_id), merged_emb
 
     def iter_pep_agg_rows(self) -> Iterator[Tuple[str, np.ndarray]]:
         """Yield peptide-only embeddings aggregated to one row per unique cysteine id."""
@@ -734,6 +773,15 @@ class MergeTablesCreator:
             logger.warning("No valid rows created for cys+pep table")
         else:
             logger.info(f"Created cys+pep table with {len(result)} rows and {result.shape[1]} columns")
+        return result
+
+    def create_cys_only_table(self) -> pd.DataFrame:
+        """Create table of cysteine-only embeddings."""
+        result = self._rows_to_dataframe(self.iter_cys_only_rows())
+        if result.empty:
+            logger.warning("No valid rows created for cys-only table")
+        else:
+            logger.info(f"Created cys-only table with {len(result)} rows and {result.shape[1]} columns")
         return result
     
     def create_cys_pep_prot_table(self) -> pd.DataFrame:
@@ -1014,6 +1062,12 @@ def main():
         help='Method for aggregating peptides: shortest peptide length or average embeddings'
     )
     parser.add_argument(
+        '--merge-strategy',
+        choices=['concat', 'average'],
+        default='concat',
+        help='How to merge embeddings across levels: concatenate or average vectors'
+    )
+    parser.add_argument(
         '--output-format',
         choices=['parquet', 'csv', 'both'],
         default='parquet',
@@ -1022,7 +1076,7 @@ def main():
     parser.add_argument(
         '--tables',
         nargs='+',
-        choices=['cys_pep', 'cys_pep_prot', 'cys_pep_prot_agg', 'cys_prot', 'pep_prot', 'pep_prot_agg', 'pep_agg', 'all'],
+        choices=['cys_only', 'cys_pep', 'cys_pep_prot', 'cys_pep_prot_agg', 'cys_prot', 'pep_prot', 'pep_prot_agg', 'pep_agg', 'all'],
         default=['all'],
         help='Which tables to create'
     )
@@ -1044,6 +1098,7 @@ def main():
         tables_to_create = args.tables
         if 'all' in tables_to_create:
             tables_to_create = [
+                'cys_only',
                 'cys_pep',
                 'cys_pep_prot',
                 'cys_pep_prot_agg',
@@ -1069,18 +1124,33 @@ def main():
             cys_emb, pep_emb, prot_emb,
             cys_ids, pep_ids, prot_ids,
             mapping,
-            aggregation_method=args.aggregation_method
+            aggregation_method=args.aggregation_method,
+            merge_strategy=args.merge_strategy,
         )
+
+        cys_level_tables = {
+            'cys_only',
+            'cys_pep',
+            'cys_pep_prot_agg',
+            'cys_prot',
+            'pep_prot_agg',
+            'pep_agg',
+        }
+
+        def build_table_name(table_key: str) -> str:
+            level_prefix = 'cys_level' if table_key in cys_level_tables else 'peptide_level'
+            return f"{level_prefix}-{table_key}-{args.merge_strategy}"
         
         table_builders = {
-            'cys_pep': ('cys_pep_merged', merger.iter_cys_pep_rows),
-            'cys_pep_prot': ('cys_pep_prot_merged', merger.iter_cys_pep_prot_rows),
-            'cys_pep_prot_agg': ('cys_pep_prot_agg_merged', merger.iter_cys_pep_prot_agg_rows),
-            'cys_prot': ('cys_prot_merged', merger.iter_cys_prot_rows),
-            'pep_prot': ('pep_prot_merged', merger.iter_pep_prot_rows),
-            'pep_prot_agg': ('pep_prot_agg_merged', merger.iter_pep_prot_agg_rows),
+            'cys_only': (build_table_name('cys_only'), merger.iter_cys_only_rows),
+            'cys_pep': (build_table_name('cys_pep'), merger.iter_cys_pep_rows),
+            'cys_pep_prot': (build_table_name('cys_pep_prot'), merger.iter_cys_pep_prot_rows),
+            'cys_pep_prot_agg': (build_table_name('cys_pep_prot_agg'), merger.iter_cys_pep_prot_agg_rows),
+            'cys_prot': (build_table_name('cys_prot'), merger.iter_cys_prot_rows),
+            'pep_prot': (build_table_name('pep_prot'), merger.iter_pep_prot_rows),
+            'pep_prot_agg': (build_table_name('pep_prot_agg'), merger.iter_pep_prot_agg_rows),
             'pep_agg': (
-                'pep_agg_merged',
+                build_table_name('pep_agg'),
                 merger.iter_pep_agg_rows,
             ),
         }
