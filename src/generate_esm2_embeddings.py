@@ -32,8 +32,8 @@ except ImportError:
 
 
 EMBEDDING_DECIMALS = 3
-PARQUET_COMPRESSION = 'zstd'
-PARQUET_COMPRESSION_LEVEL = 9
+PARQUET_COMPRESSION = 'snappy'
+PARQUET_COMPRESSION_LEVEL = None
 
 
 # ============================================================================
